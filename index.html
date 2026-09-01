@@ -321,6 +321,18 @@ Medieval Madness	35:56	18:00	1:01:49	16
     <h2>2 · Review</h2>
     <div class="sub">Confirm duplicate merges, drop low-sample games, and fix any era matches before generating banks.</div>
 
+    <div class="field" style="max-width:260px; margin-bottom:16px;">
+      <label for="roundToMinutes">Round game times to nearest</label>
+      <select id="roundToMinutes" style="font-size:13px; padding:7px 8px;">
+        <option value="1">1 minute (no rounding)</option>
+        <option value="2">2 minutes</option>
+        <option value="5" selected>5 minutes</option>
+        <option value="10">10 minutes</option>
+        <option value="15">15 minutes</option>
+      </select>
+      <div class="hint" style="margin-top:4px;">Smooths out exact-to-the-second timing noise so the balancer weighs era variety and other factors more meaningfully when times are otherwise close. Applies everywhere a time is used or shown.</div>
+    </div>
+
     <div id="mergeSection" hidden>
       <h3 style="font-family:'Kanit',sans-serif;font-size:14px;margin-bottom:8px;">Duplicate names found</h3>
       <div id="mergeList"></div>
@@ -513,20 +525,23 @@ function fmtSec(s) {
   return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
-// Every game's working average time gets rounded to the nearest ROUND_TO_MINUTES-minute mark
-// (5 min floor, so a very short manual entry never rounds down to 0) before it's used for
-// anything — deciding which bank a game lands in, how banks get balanced, or how times are
-// shown. Real play times vary run to run anyway, so exact-to-the-second averages were false
+// Every game's working average time gets rounded to the nearest `roundToMinutes`-minute mark
+// (floored at one increment, so a very short manual entry never rounds down to 0) before it's
+// used for anything — deciding which bank a game lands in, how banks get balanced, or how times
+// are shown. Real play times vary run to run anyway, so exact-to-the-second averages were false
 // precision: two games 8 seconds apart would out-rank each other in the balancer's scoring the
 // same as two games 8 minutes apart, letting meaningless timing noise outweigh factors like era
-// variety when the balancer had to pick between near-identical options. Rounding to a clean
-// 5-minute grid removes that noise and gives the balancer (and the person reading the schedule)
-// round, comparable numbers to work with instead.
-const ROUND_TO_MINUTES = 5;
-function roundGameTime(sec) {
+// variety when the balancer had to pick between near-identical options. Rounding to a clean grid
+// removes that noise and gives the balancer (and the person reading the schedule) round,
+// comparable numbers to work with instead. `roundToMinutes` is a per-run setting (the person
+// picks it in Step 2 · Review), so it's a parameter here rather than a fixed constant —
+// DEFAULT_ROUND_TO_MINUTES is only the fallback when a caller doesn't pass one.
+const DEFAULT_ROUND_TO_MINUTES = 5;
+function roundGameTime(sec, roundToMinutes) {
+  const step = roundToMinutes || DEFAULT_ROUND_TO_MINUTES;
   const minutes = sec / 60;
-  let rounded = Math.round(minutes / ROUND_TO_MINUTES) * ROUND_TO_MINUTES;
-  if (rounded < ROUND_TO_MINUTES) rounded = ROUND_TO_MINUTES;
+  let rounded = Math.round(minutes / step) * step;
+  if (rounded < step) rounded = step;
   return rounded * 60;
 }
 
@@ -608,6 +623,34 @@ function bankEraPenalty(games) {
     }
   }
   return total;
+}
+
+// eraPairPenalty's four bands are coarse enough that two very different-looking arrangements
+// can tie EXACTLY on total era cost — e.g. forcing a scarce Modern game to share a bank with a
+// same-era pair of Silver-Age games costs the same, in aggregate across every bank, as forcing
+// that same-era pair onto a Solid-State bank instead. The bands can't see which choice is
+// better; only the real numbers underneath them can. So as a tiebreaker on top of era cost —
+// never a replacement for it — sum each bank's actual (or overridden) release years and nudge
+// the balancer to keep every bank's sum close to the tournament-wide average. That keeps
+// whichever bank ends up absorbing an unavoidable clash from also quietly ending up the "all
+// old" or "all new" bank purely because the categorical cost couldn't tell the difference.
+// Games with no known year (Unknown/Custom) don't count toward either side.
+function bankYearSum(games) {
+  let sum = 0, count = 0;
+  for (const g of games) { if (typeof g.year === 'number') { sum += g.year; count++; } }
+  return { sum, count };
+}
+const YEAR_BALANCE_WEIGHT = 3; // small next to a single ERA_ORDER step (300) — breaks ties, never overrides real era-cost differences
+function yearImbalancePenalty(sum, count, idealYearPerGame) {
+  if (count === 0 || idealYearPerGame === null || idealYearPerGame === undefined) return 0;
+  return Math.abs(sum - idealYearPerGame * count) * YEAR_BALANCE_WEIGHT;
+}
+
+// Combined era + year-balance cost for a bank's lineup, given the pool-wide ideal year/game —
+// what every placement/swap/repair pass below actually compares before vs. after.
+function bankSpreadPenalty(games, idealYearPerGame) {
+  const { sum, count } = bankYearSum(games);
+  return bankEraPenalty(games) + yearImbalancePenalty(sum, count, idealYearPerGame);
 }
 
 // overrides is keyed by normalized name -> either a number (year, band computed) or
@@ -797,6 +840,13 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     throw new Error(`Slot mismatch: built ${entries.length}, needed ${expectedSlots}`);
   }
 
+  // Pool-wide target for the year-balance tiebreaker (see bankSpreadPenalty above) — the
+  // average release year across every dated game actually being placed this run. Computed once
+  // here and reused by every pass below; it doesn't change as games move between banks, only
+  // which bank's sum is being compared against it.
+  const yearsInPool = entries.filter(e => typeof e.year === 'number').map(e => e.year);
+  const idealYearPerGame = yearsInPool.length ? yearsInPool.reduce((a, b) => a + b, 0) / yearsInPool.length : null;
+
   // init banks
   const banks = Array.from({ length: numBanks }, (_, i) => ({
     total: 0, games: [], eras: new Set(), posUsed: new Set(), size: bankSizes[i],
@@ -816,9 +866,12 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   const entriesSorted = entriesForSort.sort((a, b) => b.avgSec - a.avgSec); // LPT
 
   function bankScore(b, e) {
-    let penalty = 0;
-    for (const existing of b.games) penalty += eraPairPenalty(existing.era, e.era);
-    return b.total + penalty;
+    // Marginal cost of adding e to bank b: the era pairs it would newly form, plus the change
+    // in this bank's year-balance tiebreaker. Existing-to-existing pairs don't change, so they
+    // cancel out of the before/after difference — this is equivalent to (but cheaper than)
+    // recomputing the whole bank's spread cost from scratch each time.
+    const delta = bankSpreadPenalty([...b.games, e], idealYearPerGame) - bankSpreadPenalty(b.games, idealYearPerGame);
+    return b.total + delta;
   }
 
   for (const e of entriesSorted) {
@@ -933,16 +986,17 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             const mean = (oldI + oldJ) / 2;
             const oldVar = (oldI - mean) ** 2 + (oldJ - mean) ** 2;
             const newVar = (newI - mean) ** 2 + (newJ - mean) ** 2;
-            // Fold era spread into the same accept/reject decision as time balance, so this
-            // pass can't undo the era-distance placement done above while it's evening out
-            // totals: swapping in a closer-era game (or worse, a same-era one) has to be worth
-            // it in time-balance terms, and a swap that spreads eras further apart is now a
+            // Fold era spread (plus its year-balance tiebreaker) into the same accept/reject
+            // decision as time balance, so this pass can't undo the era-distance placement done
+            // above while it's evening out totals: swapping in a closer-era game (or worse, a
+            // same-era one) has to be worth it in time-balance terms, and a swap that spreads
+            // eras further apart — or better centers each bank's release-year mix — is now a
             // point in its favor even when the time benefit alone wouldn't have justified it.
-            const oldEraPenalty = bankEraPenalty(banks[i].games) + bankEraPenalty(banks[j].games);
+            const oldSpreadPenalty = bankSpreadPenalty(banks[i].games, idealYearPerGame) + bankSpreadPenalty(banks[j].games, idealYearPerGame);
             const iGamesAfter = banks[i].games.map((g, k) => (k === pi ? gj : g));
             const jGamesAfter = banks[j].games.map((g, k) => (k === pj ? gi : g));
-            const newEraPenalty = bankEraPenalty(iGamesAfter) + bankEraPenalty(jGamesAfter);
-            if (newVar + newEraPenalty < oldVar + oldEraPenalty - 1) {
+            const newSpreadPenalty = bankSpreadPenalty(iGamesAfter, idealYearPerGame) + bankSpreadPenalty(jGamesAfter, idealYearPerGame);
+            if (newVar + newSpreadPenalty < oldVar + oldSpreadPenalty - 1) {
               banks[i].games[pi] = gj;
               banks[j].games[pj] = gi;
               banks[i].total = newI; banks[j].total = newJ;
@@ -977,15 +1031,20 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     }
     return era; // null if no era repeats within this bank
   }
-  // A same-era clash gets fixed only when a fix is actually a net improvement in total era
-  // spread — never unconditionally. With SAME_ERA_PENALTY now finite (not an infinite wall),
-  // "fix this clash no matter what" would fight the balancer's own honest trade-offs: sometimes
-  // the only way to clear one bank's clash is to force a scarce era (say, the one Modern game in
-  // a mostly-SS pool) into a cramped pairing somewhere else, which can cost more in total spread
-  // than just leaving the original clash in place. So every candidate swap is scored by the
-  // actual before/after change in combined era penalty across both banks, and only ever taken
-  // when that's a real reduction — a clash that truly can't be improved on is left as the
-  // genuinely best-available arrangement, not force-fixed at a worse cost elsewhere.
+  // A same-era clash gets fixed only when a fix is actually a net improvement in total spread
+  // cost (era penalty plus its year-balance tiebreaker) — never unconditionally. With
+  // SAME_ERA_PENALTY now finite (not an infinite wall), "fix this clash no matter what" would
+  // fight the balancer's own honest trade-offs: sometimes the only way to clear one bank's clash
+  // is to force a scarce era (say, the one Modern game in a mostly-SS pool) into a cramped
+  // pairing somewhere else, which can cost more in total spread than just leaving the original
+  // clash in place. So every candidate swap is scored by the actual before/after change in
+  // combined spread cost across both banks, and only ever taken when that's a real reduction —
+  // a clash that truly can't be improved on is left as the genuinely best-available arrangement,
+  // not force-fixed at a worse cost elsewhere. This is also where the year-balance tiebreaker
+  // earns its keep: eraPairPenalty's bands often tie exactly between "which bank absorbs the
+  // clash" candidates (categorically, it can be free to swap it either way), and the real
+  // release years break that tie toward whichever choice keeps every bank's era mix closest to
+  // the tournament-wide average instead of leaving it to swap order.
   let repairPasses = 0;
   let anyClash = banks.some(b => worstEraClash(b.games) !== null);
   while (anyClash && repairPasses < 50) {
@@ -995,10 +1054,10 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
       const targetEra = worstEraClash(banks[i].games);
       if (targetEra === null) continue;
       let bestScore = Infinity, bestSwap = null;
-      const beforePenalty = bankEraPenalty(banks[i].games);
+      const beforePenalty = bankSpreadPenalty(banks[i].games, idealYearPerGame);
       for (let j = 0; j < numBanks; j++) {
         if (i === j) continue;
-        const beforeJ = bankEraPenalty(banks[j].games);
+        const beforeJ = bankSpreadPenalty(banks[j].games, idealYearPerGame);
         for (let pi = 0; pi < banks[i].games.length; pi++) {
           const gi = banks[i].games[pi];
           if (gi.era !== targetEra) continue; // only relocate one of the clustered-era games
@@ -1012,8 +1071,8 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             if (otherINames.includes(gj.name) || otherJNames.includes(gi.name)) continue;
             const iGamesAfter = banks[i].games.map((g, k) => (k === pi ? gj : g));
             const jGamesAfter = banks[j].games.map((g, k) => (k === pj ? gi : g));
-            const afterPenalty = bankEraPenalty(iGamesAfter) + bankEraPenalty(jGamesAfter);
-            // Only a genuine net improvement in combined era spread counts as a fix — a swap
+            const afterPenalty = bankSpreadPenalty(iGamesAfter, idealYearPerGame) + bankSpreadPenalty(jGamesAfter, idealYearPerGame);
+            // Only a genuine net improvement in combined spread cost counts as a fix — a swap
             // that clears bank i's clash by creating an equally- or more-costly one in bank j
             // (or elsewhere down the line) is not an improvement and is left alone.
             if (afterPenalty >= beforePenalty + beforeJ - 1e-9) continue;
@@ -1354,10 +1413,12 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     for (const g of games) {
       if (state.timeOverride[g.name] !== undefined) g.avgSec = state.timeOverride[g.name];
     }
-    // Round every game's working time to a clean 5-minute mark — see roundGameTime in logic.js —
-    // so the balancer (and the Game list, and every other place a time is shown) works from the
-    // same rounded number, not the exact-to-the-second average.
-    for (const g of games) g.avgSec = roundGameTime(g.avgSec);
+    // Round every game's working time to a clean grid — see roundGameTime in logic.js — so the
+    // balancer (and the Game list, and every other place a time is shown) works from the same
+    // rounded number, not the exact-to-the-second average. The grid size is a per-run setting
+    // (Step 2's "Round game times to nearest" control), not fixed.
+    const roundToMinutes = getRoundToMinutes();
+    for (const g of games) g.avgSec = roundGameTime(g.avgSec, roundToMinutes);
     state.workingGames = games;
   }
 
@@ -1605,7 +1666,21 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       const simpleRadio = document.querySelector('input[name="eraBalanceMode"][value="simple"]');
       if (simpleRadio) simpleRadio.checked = true;
     }
+    if (savedSettings.roundToMinutes) $('roundToMinutes').value = String(savedSettings.roundToMinutes);
   }
+
+  // ---------- Step 2: rounding granularity ----------
+  // A per-run setting rather than a fixed constant — see roundGameTime in logic.js. Changing it
+  // rebuilds state.workingGames from scratch (every downstream time depends on it) and re-renders
+  // Step 2's merge/exclude/era tables so the new rounding is reflected immediately; if banks were
+  // already generated, the person re-generates to pick it up there too (same as any other Step 2
+  // edit — merge choice, a time override, an era fix).
+  function getRoundToMinutes() { return parseInt($('roundToMinutes').value, 10) || DEFAULT_ROUND_TO_MINUTES; }
+  $('roundToMinutes').addEventListener('change', () => {
+    const existing = safeGet(LS_SETTINGS) || {};
+    safeSet(LS_SETTINGS, { ...existing, roundToMinutes: getRoundToMinutes() });
+    if (state.rows.length || state.manualGames.length) renderStep2();
+  });
 
   function getEraBalanceMode() {
     const checked = document.querySelector('input[name="eraBalanceMode"]:checked');
@@ -1661,7 +1736,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     const bankSize = parseInt($('bankSize').value, 10);
     if (!numBanks || !bankSize) return false;
     const eraBalance = getEraBalanceMode();
-    safeSet(LS_SETTINGS, { numBanks, bankSize, eraBalance });
+    safeSet(LS_SETTINGS, { numBanks, bankSize, eraBalance, roundToMinutes: getRoundToMinutes() });
     let idealResult;
     try {
       const forced = Object.keys(state.forceInclude).filter(n => state.forceInclude[n]);
@@ -2013,6 +2088,16 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // that only touches this bank (held-out fills, or "no change") — comfortably below
   // CONFLICT_PENALTY so an outright conflict still sorts dead last of all.
   const REPEAT_CANDIDATE_PENALTY = 500; // mild nudge against picking an already-shared game
+  // Pool-wide average release year, used the same way buildBanks() uses it internally: a small
+  // tiebreaker on top of era-pairwise cost (see bankSpreadPenalty/bankYearSum/yearImbalancePenalty
+  // in logic.js) so a manual swap that's a wash on era bands alone still gets nudged toward
+  // whichever bank keeps its release-year mix closest to the tournament-wide average, instead of
+  // leaving that pick to whichever option happened to sort first.
+  function currentIdealYearPerGame(result) {
+    const years = [];
+    result.banks.forEach(b => { for (let pp = 1; pp <= b.size; pp++) { const g = b.pos[pp]; if (g && typeof g.year === 'number') years.push(g.year); } });
+    return years.length ? years.reduce((a, b) => a + b, 0) / years.length : null;
+  }
   function optionFitScore(result, bi, p, s) {
     let score = 0;
     if (s.bi !== bi) {
@@ -2028,7 +2113,9 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         for (let pp = 1; pp <= bank.size; pp++) arr.push(pp === posToReplace ? replacement : bank.pos[pp]);
         return arr;
       }
-      score += bankEraPenalty(gamesAfterSwap(bankA, p, gameB)) + bankEraPenalty(gamesAfterSwap(bankB, s.p, gameA));
+      const gamesAAfter = gamesAfterSwap(bankA, p, gameB), gamesBAfter = gamesAfterSwap(bankB, s.p, gameA);
+      const idealYearPerGame = currentIdealYearPerGame(result);
+      score += bankSpreadPenalty(gamesAAfter, idealYearPerGame) + bankSpreadPenalty(gamesBAfter, idealYearPerGame);
       if (result.repeats.includes(gameB.name)) score += REPEAT_CANDIDATE_PENALTY;
     }
     if (!s.valid) score += CONFLICT_PENALTY;
@@ -2064,7 +2151,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     let score = (incoming.avgSec - outgoing.avgSec) ** 2;
     const gamesAfter = [];
     for (let pp = 1; pp <= bank.size; pp++) gamesAfter.push(pp === p ? incoming : bank.pos[pp]);
-    score += bankEraPenalty(gamesAfter);
+    score += bankSpreadPenalty(gamesAfter, currentIdealYearPerGame(result));
     return score;
   }
 
