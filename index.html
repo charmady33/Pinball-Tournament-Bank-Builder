@@ -1649,14 +1649,19 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (genOpts.perturb) {
       result = cloneSnapshot(state.idealSnapshot);
       recomputeDerived(result);
-      // The longest bank's total is what actually decides how long the whole event runs — that's
-      // the number to protect. "Try another arrangement" is free to be a genuinely different mix,
-      // but it shouldn't be free to make the event longer than it has to be: every perturbation
-      // step below is bounded so it doesn't push any bank's total far past what the ideal
-      // arrangement's longest bank already totals.
-      const idealMaxTotal = Math.max(...idealResult.banks.map(b => b.total));
-      perturbIncludedSet(result, idealMaxTotal);
-      perturbArrangement(result, idealMaxTotal);
+      // The longest bank's total is what actually decides how long the whole event runs, and the
+      // SPREAD between banks is what decides how long the fastest group sits around waiting on
+      // everyone else — both matter, so both get protected. "Try another arrangement" is free to
+      // be a genuinely different mix, but not free to make the event longer than it has to be, or
+      // to leave one bank finishing well before another: every perturbation step below is bounded
+      // so it doesn't push any bank's total far past the ideal arrangement's longest bank, AND
+      // doesn't widen the max-minus-min spread across banks far past what the ideal already has.
+      const idealTotals = idealResult.banks.map(b => b.total);
+      const idealMaxTotal = Math.max(...idealTotals);
+      const idealRange = idealMaxTotal - Math.min(...idealTotals);
+      const idealStats = { max: idealMaxTotal, range: idealRange };
+      perturbIncludedSet(result, idealStats);
+      perturbArrangement(result, idealStats);
       recomputeDerived(result);
     }
 
@@ -1823,10 +1828,12 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return true;
   }
 
-  // How much "Try another arrangement" is allowed to raise the longest bank's total over the
-  // ideal arrangement's longest bank — the real bottleneck for how long the whole event runs.
-  // Keeping the max low is the actual goal; a shuffle earns its variety by staying inside this
-  // budget, not by ignoring it.
+  // How much "Try another arrangement" is allowed to raise the longest bank's total, and the
+  // max-minus-min spread across banks, over what the ideal arrangement already has. The longest
+  // bank decides how long the whole event runs; the spread decides how long the fastest group
+  // sits around waiting on everyone else — keeping both low (people roughly finishing together)
+  // is the actual goal, and a shuffle earns its variety by staying inside this budget on BOTH,
+  // not by ignoring either one.
   const MAX_TOTAL_TOLERANCE_FRACTION = 0.06;
 
   // "Try another arrangement" starts from the ideal, best-balanced layout and nudges it — one
@@ -1834,15 +1841,18 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // at instead of risking the balancer's own swap-optimize pass reconverging to the same
   // grouping it would've built anyway. It's not weighted toward the single best-scoring
   // candidate the way the per-bank refresh is — that would just rebuild something close to ideal
-  // again — but it IS bounded: every candidate is scored by the worse of the two banks' totals
-  // it would produce, and only candidates that keep that within budget of idealMaxTotal are
-  // considered — a position with nothing in-budget is simply skipped rather than forced through
-  // with the least-bad option, so "different" never means "the event runs a lot longer than it
-  // needs to."
-  function perturbArrangement(result, idealMaxTotal) {
+  // again — but it IS bounded: every candidate is scored by the resulting max total AND the
+  // resulting spread across every bank (not just the two being swapped — a swap that keeps both
+  // banks under the max but drops one of them far below everyone else would still widen the
+  // spread the tournament actually feels), and only candidates that keep BOTH within budget of
+  // the ideal arrangement are considered — a position with nothing in-budget is simply skipped
+  // rather than forced through with the least-bad option, so "different" never means "the event
+  // runs longer, or some banks sit around a lot longer than others, than it needs to."
+  function perturbArrangement(result, idealStats) {
     const numBanks = result.banks.length;
     if (numBanks < 2) return false;
-    const tolerance = idealMaxTotal * MAX_TOTAL_TOLERANCE_FRACTION;
+    const tolerance = idealStats.max * MAX_TOTAL_TOLERANCE_FRACTION;
+    const rangeBudget = idealStats.range + tolerance;
     const bankOrder = Array.from({ length: numBanks }, (_, i) => i);
     for (let i = bankOrder.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1870,9 +1880,16 @@ Dracula\t23:47\t23:47\t23:47\t1`;
           const gameA = bankA.pos[p], gameB = bankB.pos[c.p];
           const newTotalA = bankA.total - gameA.avgSec + gameB.avgSec;
           const newTotalB = bankB.total - gameB.avgSec + gameA.avgSec;
-          return { c, resultingMax: Math.max(newTotalA, newTotalB) };
+          let resultingMax = Math.max(newTotalA, newTotalB);
+          let resultingMin = Math.min(newTotalA, newTotalB);
+          result.banks.forEach((bk, bi2) => {
+            if (bi2 === bankIndex || bi2 === c.bi) return;
+            if (bk.total > resultingMax) resultingMax = bk.total;
+            if (bk.total < resultingMin) resultingMin = bk.total;
+          });
+          return { c, resultingMax, resultingRange: resultingMax - resultingMin };
         });
-        const within = scored.filter(s => s.resultingMax <= idealMaxTotal + tolerance);
+        const within = scored.filter(s => s.resultingMax <= idealStats.max + tolerance && s.resultingRange <= rangeBudget);
         if (!within.length) continue; // nothing here stays in budget — try another position in this bank instead
         const pick = within[Math.floor(Math.random() * within.length)].c; // random WITHIN budget — still not "always best"
         swapSlots(result, { bi: bankIndex, p }, pick);
@@ -1889,11 +1906,13 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // always loses it) would look "stuck" no matter how many times you shuffle. Swap a few held-out
   // games back in for currently-included, non-repeated games before rearranging rounds/banks,
   // preferring a same-era swap so the era balance the settings asked for doesn't drift — and,
-  // same as above, bounded so bringing a game back in can't blow up the longest bank's total.
-  function perturbIncludedSet(result, idealMaxTotal) {
+  // same as above, bounded so bringing a game back in can't blow up the longest bank's total or
+  // the spread between banks.
+  function perturbIncludedSet(result, idealStats) {
     const dropped = result.droppedGames || [];
     if (!dropped.length) return false;
-    const tolerance = idealMaxTotal * MAX_TOTAL_TOLERANCE_FRACTION;
+    const tolerance = idealStats.max * MAX_TOTAL_TOLERANCE_FRACTION;
+    const rangeBudget = idealStats.range + tolerance;
     const shuffled = [...dropped];
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1906,7 +1925,17 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       const includedSlots = allSlotsFlat(result).filter(s => !result.repeats.includes(s.game.name));
       if (!includedSlots.length) break;
       const resultingTotal = s => result.banks[s.bi].total - result.banks[s.bi].pos[s.p].avgSec + incoming.avgSec;
-      const withinBudget = s => resultingTotal(s) <= idealMaxTotal + tolerance;
+      const withinBudget = s => {
+        const newTotal = resultingTotal(s);
+        if (newTotal > idealStats.max + tolerance) return false;
+        let resultingMax = newTotal, resultingMin = newTotal;
+        result.banks.forEach((bk, bi2) => {
+          if (bi2 === s.bi) return;
+          if (bk.total > resultingMax) resultingMax = bk.total;
+          if (bk.total < resultingMin) resultingMin = bk.total;
+        });
+        return (resultingMax - resultingMin) <= rangeBudget;
+      };
       const sameEra = includedSlots.filter(s => s.game.era === incoming.era);
       // Prefer a same-era, in-budget slot; widen to any era if that's empty; skip this held-out
       // game this round (rather than force an over-budget swap) if nothing qualifies at all.
@@ -1928,20 +1957,24 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // Mirrors the same "totals variance + era penalty" scoring the balancer itself uses when
   // deciding whether a swap is worth making (see the swap-optimize pass in logic.js), so the
   // dropdown's best-to-worst ordering reflects the same notion of "fits well" as the rest of
-  // the tool — plus two more factors the manual dropdown cares about that the balancer doesn't:
-  // a candidate that's already scheduled in two banks (a "repeat"/shared game) is a slightly
+  // the tool — plus the extra factors the manual dropdown cares about that the balancer doesn't:
+  // a swap that reaches into ANOTHER bank changes that bank's lineup too, which is a bigger deal
+  // than filling this round from the held-out pool (which touches nothing else) — so it's always
+  // ranked below every non-disruptive option, however good its era/time fit looks on paper. A
+  // candidate that's already scheduled in two banks (a "repeat"/shared game) is a slightly
   // messier choice than a game that's only ever in one place, and an option that would actually
   // create a conflict (a duplicate within a bank, or a same-round clash across banks) is always
-  // sorted below every non-conflicting option, however good its era/time fit looks on paper —
-  // it's still offered (never hidden), just never preferred. A swap within the very same bank
-  // never changes that bank's game lineup (only which round each game lands in), so it can't
-  // affect era spread, bank totals, or repeat count — those options score 0 before any conflict
-  // penalty, and float to the top alongside "no change".
-  const CONFLICT_PENALTY = 1e9; // always outweighs era/time/repeat scoring, whatever the bank size
+  // sorted below everything else, valid or not — it's still offered (never hidden), just never
+  // preferred.
+  const CONFLICT_PENALTY = 1e9; // always outweighs everything else, whatever the bank size
+  const DISRUPTIVE_PENALTY = 5e7; // reaching into another bank always ranks below every option
+  // that only touches this bank (held-out fills, or "no change") — comfortably below
+  // CONFLICT_PENALTY so an outright conflict still sorts dead last of all.
   const REPEAT_CANDIDATE_PENALTY = 500; // mild nudge against picking an already-shared game
   function optionFitScore(result, bi, p, s) {
     let score = 0;
     if (s.bi !== bi) {
+      score += DISRUPTIVE_PENALTY;
       const bankA = result.banks[bi], bankB = result.banks[s.bi];
       const gameA = bankA.pos[p], gameB = bankB.pos[s.p];
       const newTotalA = bankA.total - gameA.avgSec + gameB.avgSec;
@@ -2097,25 +2130,35 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         const slotId = `${bi}-${p}`;
         // Every ACTIVE game is offered — not just the ones currently occupying a slot, but every
         // game from the originally-reviewed pool, including anything currently held out for lack
-        // of room. Nothing is hidden: an option that would create a duplicate within a bank or a
-        // new round collision (the same game already scheduled for this round in some other
-        // bank) is still selectable, just flagged "conflicts" so the user can make an informed
-        // call. Sorted best fit to worst: era spread + time balance + repeat-count all factor in
-        // (see optionFitScore/insertFitScore), and any conflicting option always sorts after
-        // every non-conflicting one, regardless of how good its other numbers look.
-        const slotOptions = flatSlots.map(s => {
-          const valid = (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p });
-          return { kind: 'slot', bi: s.bi, p: s.p, game: s.game, valid, selected: s.bi === bi && s.p === p, score: optionFitScore(result, bi, p, { bi: s.bi, p: s.p, valid }) };
-        });
+        // of room. A game already sitting in THIS bank (in a different round) is left out
+        // entirely rather than offered as a swap-in — picking it wouldn't actually bring a
+        // different game into the bank, just reorder which round it plays, which isn't what this
+        // control is for. Nothing else is hidden: an option that would create a duplicate within
+        // a bank or a new round collision is still selectable, just flagged "conflicts" so the
+        // user can make an informed call, and an option that reaches into ANOTHER bank (and so
+        // changes that bank's lineup too) is flagged and always sorted below every option that
+        // only affects this one — a held-out fill never touches another bank; a cross-bank swap
+        // always does, which is a worse arrangement even when the numbers look good. Sorted best
+        // fit to worst within each of those tiers (era spread + time balance + repeat-count all
+        // factor in — see optionFitScore/insertFitScore).
+        const slotOptions = flatSlots
+          .filter(s => s.bi !== bi || s.p === p) // drop same-bank/other-round — see above
+          .map(s => {
+            const valid = (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p });
+            const disruptive = s.bi !== bi;
+            return { kind: 'slot', bi: s.bi, p: s.p, game: s.game, valid, disruptive, selected: s.bi === bi && s.p === p, score: optionFitScore(result, bi, p, { bi: s.bi, p: s.p, valid }) };
+          });
         const dropOptions = (result.droppedGames || []).map((g, idx) => {
           let valid = true;
           for (let pp = 1; pp <= b.size; pp++) { if (pp !== p && b.pos[pp].name === g.name) { valid = false; break; } }
-          return { kind: 'drop', idx, game: g, valid, selected: false, score: insertFitScore(result, bi, p, g) + (valid ? 0 : CONFLICT_PENALTY) };
+          return { kind: 'drop', idx, game: g, valid, disruptive: false, selected: false, score: insertFitScore(result, bi, p, g) + (valid ? 0 : CONFLICT_PENALTY) };
         });
         const options = state.editMode ? [...slotOptions, ...dropOptions].sort((x, y) => x.score - y.score) : [];
+        const optionNote = o => (o.disruptive ? ` — also changes Bank ${o.bi + 1}` : '') + (o.valid ? '' : ' — conflicts');
+        const optionStyle = o => !o.valid ? ' style="color:#b45309;"' : (o.disruptive ? ' style="color:#8a8f98;"' : '');
         const swapControl = state.editMode ? `
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
-              ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${o.valid ? '' : ' style="color:#b45309;"'}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${o.valid ? '' : ' — conflicts'}</option>`).join('')}
+              ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${optionStyle(o)}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${optionNote(o)}</option>`).join('')}
             </select>` : '';
         slots.push(`
           <div class="slot">
