@@ -236,12 +236,22 @@ footer.notes li{margin-bottom:4px;}
 .actions{display:flex; gap:10px; flex-wrap:wrap; margin-top:16px;}
 [hidden]{display:none !important;}
 
+#printGrid{display:none;}
+.exportWrap{position:relative; display:inline-block;}
+#exportMenu{position:absolute; top:calc(100% + 4px); left:0; min-width:170px; background:var(--panel); border:1px solid var(--border); border-radius:10px; box-shadow:var(--shadow); overflow:hidden; z-index:30;}
+.exportMenuItem{display:block; width:100%; text-align:left; padding:10px 14px; border:none; border-radius:0; background:transparent; color:var(--ink); font-weight:500; cursor:pointer;}
+.exportMenuItem:hover{background:var(--panel-2);}
+.exportMenuItem:active{transform:none;}
+
 @media print{
-  body{background:#fff; color:#000;}
-  .card:not(#resultsCard):not(#droppedSection), .steps, .actions, .no-print{display:none !important;}
-  #resultsCard{display:block !important; box-shadow:none; border:none;}
-  #droppedSection{box-shadow:none; border:none;}
-  .bankCard{break-inside:avoid; border-color:#999;}
+  /* Print matches the PDF/Word export exactly: the same bank grid table, built by the same
+     layout code (pickBankGridLayout/exportPageLayout), rendered into #printGrid right before
+     printing — everything else is removed from the page entirely (display:none, not just
+     hidden) so it can't leave behind blank pages of its own layout height. */
+  body{background:#fff;}
+  .wrap{display:none !important;}
+  #printGrid{display:block !important;}
+  @page{size:landscape; margin:0;}
 }
 </style>
 
@@ -272,12 +282,12 @@ footer.notes li{margin-bottom:4px;}
         <p><strong>1 · Qualifying data (optional):</strong> paste your matchplay.events export, or skip straight to step 2.</p>
         <p><strong>2 · Review:</strong> every game is included by default. Fix any era matches that need it, edit a time estimate by clicking it, or uncheck Active to hold a game out entirely. Add games by hand here too.</p>
         <p><strong>3 · Bank settings:</strong> choose how many banks and the target games per bank, and how ties should be broken if there are more games than slots (see "Too many games" below). Everything recalculates live.</p>
-        <p><strong>4 · Banks:</strong> review the generated banks, then print, copy as text, or download a Word or PDF report. Don't like the result? "Try another arrangement" reruns the balancer from scratch for a different valid layout; the ↻ next to a bank's name refreshes just that bank; "Refresh all banks" does the same for every bank at once. Use "Edit banks" for hands-on control — its dropdown lists every game, sorted best fit to worst for that slot; an option that would create a duplicate or a same-round clash elsewhere is still selectable but flagged "conflicts" so you know before choosing it.</p>
+        <p><strong>4 · Banks:</strong> review the generated banks, then copy as text or use "Export" to download a Word or PDF report — Print produces that same page-filling grid layout too, so what you print matches what you'd download. Don't like the result? "Try another arrangement" reruns the balancer from scratch for a different valid layout; the ↻ next to a bank's name keeps every other bank as-is and tries a fresh, balance-aware mix for just that one — it still favors good era/time fits like the balancer does, so it's "try again" for that bank rather than a purely random shuffle. Use "Edit banks" for hands-on control — its dropdown lists every game, sorted best fit to worst for that slot; an option that would create a duplicate or a same-round clash elsewhere is still selectable but flagged "conflicts" so you know before choosing it.</p>
       </section>
       <section>
         <h3>How balancing works</h3>
         <p><strong>Balancing:</strong> banks are built to keep total play time about even across all of them — the longest games get placed first, then games get swapped between banks to even out the totals — while also spreading machine eras out within each bank rather than clustering them. Two games of the same era are avoided in the same bank whenever there's a choice, and beyond that, farther-apart eras are preferred over adjacent ones — an EM paired with a Modern is favored over an EM paired with an SS, for example.</p>
-        <p><strong>Too few games:</strong> the shortest-average games repeat across two banks so every bank still hits the target size, and each repeat's two rounds are spaced as far apart as possible so the same machine isn't needed by two groups at once.</p>
+        <p><strong>Too few games:</strong> the shortest-average games repeat across as many banks as needed so every bank still hits the target size (a game is never scheduled twice in the <em>same</em> bank) — most of the time that's just two banks, but if the pool is short enough a game can repeat into more. Each occurrence's round is chosen to keep its uses spread across different parts of the tournament timeline, not just different round numbers, so the same physical machine is as unlikely as possible to be needed by two groups at once.</p>
         <p><strong>Too many games:</strong> extra games are automatically held out for that run. By default, each era's share of the banks stays about the same as the active pool's, always holding out the longest-average game first within whichever era has to give some up — or switch to the "ignore era" option in step 3 to just hold out the overall longest games instead. You can force a specific held-out game back in ("Include instead" in the Held out this run table); the algorithm automatically holds out a different game to compensate.</p>
       </section>
     </div>
@@ -431,7 +441,7 @@ Medieval Madness	35:56	18:00	1:01:49	16
       <h3 style="font-family:'Kanit',sans-serif;font-size:14px;margin-bottom:8px;">Repeated games — round spacing</h3>
       <div class="tablewrap">
         <table>
-          <thead><tr><th>Game</th><th>Round 1 bank</th><th id="repeatLastRoundHeader">Last round</th><th class="num">Avg time</th></tr></thead>
+          <thead><tr><th>Game</th><th>Scheduled in</th><th class="num">Avg time</th></tr></thead>
           <tbody id="repeatTableBody"></tbody>
         </table>
       </div>
@@ -439,12 +449,16 @@ Medieval Madness	35:56	18:00	1:01:49	16
 
     <div class="actions no-print">
       <button class="ghost" id="shuffleBtn" type="button" title="Rerun the balancer for a different valid arrangement">↻ Try another arrangement</button>
-      <button class="ghost" id="refreshAllBtn" type="button" title="Refresh every bank at once — swap in a different mix of games across all banks">↻ Refresh all banks</button>
       <button class="ghost" id="editBanksBtn" type="button">Edit banks</button>
       <button class="ghost" id="resetEditsBtn" type="button" hidden>Reset to auto-generated</button>
-      <button class="ghost" id="downloadDocxBtn" type="button" hidden>Download Word (.docx)</button>
-      <button class="ghost" id="downloadPdfBtn" type="button" hidden>Download PDF</button>
-      <button class="ghost" id="printBtn" type="button">Print</button>
+      <div class="exportWrap">
+        <button class="ghost" id="exportBtn" type="button" hidden aria-haspopup="true" aria-expanded="false">Export ▾</button>
+        <div id="exportMenu" hidden role="menu">
+          <button class="exportMenuItem" id="exportDocxBtn" type="button" role="menuitem">Word (.docx)</button>
+          <button class="exportMenuItem" id="exportPdfBtn" type="button" role="menuitem">PDF</button>
+        </div>
+      </div>
+      <button class="ghost" id="printBtn" type="button" title="Prints the same page-filling grid layout as the PDF export">Print</button>
       <button class="ghost" id="copyBtn" type="button">Copy as text</button>
       <button class="ghost" id="startOverBtn" type="button">Start a new tournament</button>
       <span id="downloadMsg" class="hint" style="margin-top:0; width:100%;" hidden></span>
@@ -457,6 +471,10 @@ Medieval Madness	35:56	18:00	1:01:49	16
     <p>Built-in era lookup is a convenience, not a pinball encyclopedia — always sanity-check anything it guessed. Your era corrections are saved in this browser for next time.</p>
   </footer>
 </div>
+
+<!-- Sibling of .wrap, not a child of it — @media print hides .wrap wholesale (display:none),
+     which would take any descendant down with it regardless of its own display rule. -->
+<div id="printGrid"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/docx@9.5.1/dist/index.iife.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.2.1/jspdf.umd.min.js"></script>
@@ -691,6 +709,7 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   const targetSlots = numBanks * bankSize;
   let pool = [...games];
   let repeats = [];
+  let repeatCounts = {}; // name -> count of copies BEYOND the first (0 for a non-repeat game)
   let droppedGames = [];
   let forceIncludeFailed = [];
   const bankSizes = Array.from({ length: numBanks }, () => bankSize); // always strict
@@ -710,10 +729,28 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     pool = kept;
     droppedGames = dropped;
   } else if (pool.length < targetSlots) {
-    const deficit = targetSlots - pool.length;
-    // choose shortest-avg games to duplicate (fastest turnover), not already picked twice
+    let deficit = targetSlots - pool.length;
+    // choose shortest-avg games to duplicate first (fastest turnover), round-robining extra
+    // copies across them if one repeat each still isn't enough to fill every slot. A game can
+    // never appear twice in the same bank, so it can never have more copies than there are
+    // banks — once every game is maxed out at one copy per bank, there's nothing left to give.
     const candidates = [...pool].sort((a, b) => a.avgSec - b.avgSec);
-    repeats = candidates.slice(0, deficit).map(g => g.name);
+    const maxCopiesPerGame = Math.max(1, numBanks);
+    let guard = 0;
+    while (deficit > 0 && guard < candidates.length * maxCopiesPerGame + 5) {
+      guard++;
+      let placedThisPass = false;
+      for (const g of candidates) {
+        if (deficit <= 0) break;
+        const current = 1 + (repeatCounts[g.name] || 0);
+        if (current >= maxCopiesPerGame) continue;
+        repeatCounts[g.name] = (repeatCounts[g.name] || 0) + 1;
+        deficit--;
+        placedThisPass = true;
+      }
+      if (!placedThisPass) break; // every game already has one copy per bank — genuinely out of room
+    }
+    repeats = Object.keys(repeatCounts);
   }
   const maxBankSize = bankSize;
 
@@ -721,7 +758,8 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   const entries = [];
   for (const g of pool) {
     entries.push({ ...g, dupInstance: null });
-    if (repeats.includes(g.name)) {
+    const extraCopies = repeatCounts[g.name] || 0;
+    for (let k = 0; k < extraCopies; k++) {
       entries.push({ ...g, dupInstance: true });
     }
   }
@@ -890,21 +928,63 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     }
   }
 
-  // assign positions: repeated games get spread across [1..size] as evenly as possible;
-  // for the common size=3, single-repeat case that's position 1 and the last position.
+  // Assign positions (rounds). For a repeated game, the round in each bank matters more than
+  // for any other game: it's the same physical machine, so the different groups that need it
+  // shouldn't want it at the same real-world moment. Round NUMBER alone doesn't capture that —
+  // "round 1" in a bank with short games happens much sooner, in wall-clock terms, than "round
+  // 1" in a bank full of long ones. So each candidate round is scored by roughly where it falls
+  // in THAT bank's own timeline (its round number as a fraction of that bank's total rounds,
+  // which stands in for a fraction of that bank's total playtime), and — for a game repeated
+  // more than twice — rounds are chosen bank by bank, each one picking whichever free round is
+  // farthest (in that timeline sense) from the rounds already picked for the same game
+  // elsewhere. Games hosted by the most banks are placed first, since they have the least
+  // slack to work with once other repeats start claiming rounds.
+  const repeatHostBanks = {}; // name -> [bankIndex, ...] (only for repeated games)
+  for (let bi = 0; bi < numBanks; bi++) {
+    banks[bi].games.forEach(g => {
+      if (repeats.includes(g.name)) (repeatHostBanks[g.name] = repeatHostBanks[g.name] || []).push(bi);
+    });
+  }
+  const claimedRounds = Array.from({ length: numBanks }, () => new Set());
+  function timeFraction(bi, round) { return (round - 0.5) / banks[bi].size; }
+  const repeatRoundByNameAndBank = {}; // name -> { bankIndex: round }
+  Object.keys(repeatHostBanks)
+    .sort((a, b) => repeatHostBanks[b].length - repeatHostBanks[a].length)
+    .forEach(name => {
+      const hostBanks = repeatHostBanks[name];
+      const chosenFractions = [];
+      const rounds = {};
+      const order = [...hostBanks].sort((a, b) => {
+        const freeA = banks[a].size - claimedRounds[a].size, freeB = banks[b].size - claimedRounds[b].size;
+        return freeA - freeB; // most-constrained bank picks first
+      });
+      for (const bi of order) {
+        const size = banks[bi].size;
+        let bestRound = null, bestGap = -Infinity;
+        for (let p = 1; p <= size; p++) {
+          if (claimedRounds[bi].has(p)) continue;
+          const frac = timeFraction(bi, p);
+          const gap = chosenFractions.length === 0 ? 1 : Math.min(...chosenFractions.map(f => Math.abs(f - frac)));
+          if (gap > bestGap) { bestGap = gap; bestRound = p; }
+        }
+        if (bestRound === null) bestRound = 1; // shouldn't happen — every bank has room for its own repeats
+        rounds[bi] = bestRound;
+        claimedRounds[bi].add(bestRound);
+        chosenFractions.push(timeFraction(bi, bestRound));
+      }
+      repeatRoundByNameAndBank[name] = rounds;
+    });
+
   for (let bi = 0; bi < numBanks; bi++) {
     const b = banks[bi];
     const size = b.size;
     const pos = new Array(size + 1).fill(null); // 1-indexed
-    const remaining = [...b.games];
-    for (const g of [...remaining]) {
+    const remaining = [];
+    for (const g of b.games) {
       if (repeats.includes(g.name)) {
-        const isFirst = dupFirstBank[g.name] === bi;
-        const p = isFirst ? 1 : size;
-        if (pos[p] === null) {
-          pos[p] = g;
-          remaining.splice(remaining.indexOf(g), 1);
-        }
+        pos[repeatRoundByNameAndBank[g.name][bi]] = g;
+      } else {
+        remaining.push(g);
       }
     }
     const freeSlots = [];
@@ -913,13 +993,55 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     b.pos = pos;
   }
 
-  // validation: round collisions (only compare banks that actually have that round/position)
-  const roundCollisions = {};
-  for (let p = 1; p <= maxBankSize; p++) {
-    const names = banks.filter(b => b.size >= p).map(b => b.pos[p].name);
-    const dupes = names.filter((n, idx) => names.indexOf(n) !== idx);
-    if (dupes.length) roundCollisions[p] = [...new Set(dupes)];
+  function computeRoundCollisions() {
+    const collisions = {};
+    for (let p = 1; p <= maxBankSize; p++) {
+      const names = banks.filter(b => b.size >= p).map(b => b.pos[p].name);
+      const dupes = names.filter((n, idx) => names.indexOf(n) !== idx);
+      if (dupes.length) collisions[p] = [...new Set(dupes)];
+    }
+    return collisions;
   }
+
+  // Repair pass: the greedy round choice above optimizes each repeated game's spacing on its
+  // own, which mostly avoids round collisions but — when several different repeated games are
+  // all competing for slots in the same crowded banks — can still leave some behind. Clean up
+  // what's left by swapping a colliding occurrence with another round in the SAME bank (never
+  // moving it to a different bank, which would undo the placement work above), but only when
+  // the swap doesn't just relocate the collision somewhere else. This can't introduce a
+  // same-bank duplicate — it's just reordering which round already-held games sit in.
+  let collisions = computeRoundCollisions();
+  let repairGuard = 0;
+  while (Object.keys(collisions).length && repairGuard < 50) {
+    repairGuard++;
+    let fixedAny = false;
+    for (const roundStr of Object.keys(collisions)) {
+      const round = parseInt(roundStr, 10);
+      for (const name of collisions[round]) {
+        const hostBanksAtRound = [];
+        banks.forEach((b, bi) => { if (b.size >= round && b.pos[round].name === name) hostBanksAtRound.push(bi); });
+        for (let k = 1; k < hostBanksAtRound.length; k++) { // leave the first occurrence in place
+          const bi = hostBanksAtRound[k];
+          const b = banks[bi];
+          for (let altRound = 1; altRound <= b.size; altRound++) {
+            if (altRound === round) continue;
+            const other = b.pos[altRound];
+            const otherOkAtRound = !banks.some((b2, i2) => i2 !== bi && b2.size >= round && b2.pos[round].name === other.name);
+            const nameOkAtAltRound = !banks.some((b2, i2) => i2 !== bi && b2.size >= altRound && b2.pos[altRound].name === name);
+            if (otherOkAtRound && nameOkAtAltRound) {
+              const tmp = b.pos[round]; b.pos[round] = b.pos[altRound]; b.pos[altRound] = tmp;
+              fixedAny = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!fixedAny) break; // remaining collisions are structurally unavoidable — pigeonhole (more
+    // occurrences of a game than there are rounds to spread them across), surfaced as-is below.
+    collisions = computeRoundCollisions();
+  }
+  const roundCollisions = collisions;
 
   return { banks, repeats, dupFirstBank, roundCollisions, bankSizes, droppedGames, forceIncludeFailed };
 }
@@ -1355,7 +1477,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     } else if (unique < target && target - unique > unique) {
       warnEl.hidden = false;
       warnEl.classList.add('warn'); warnEl.classList.remove('good');
-      warnEl.innerHTML = `<span class="icon">!</span><span>${target} target slots needs more repeats than the pool supports well (a game would have to repeat more than once). Add more games, or lower banks/target size.</span>`;
+      warnEl.innerHTML = `<span class="icon">!</span><span>${target} target slots is a lot more than the ${unique} games available — some games will need to repeat into more than two banks (never twice in the <em>same</em> bank), each occurrence scheduled as far apart in real time as the arrangement allows. If a bank ever truly can't avoid using a game at the same time as another bank, you'll see it flagged in the results. For a cleaner run, add more games or lower banks/target size.</span>`;
     } else if (unique < target) {
       warnEl.hidden = false;
       warnEl.classList.remove('warn'); warnEl.classList.add('good');
@@ -1439,10 +1561,6 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     runGenerate();
   });
 
-  // Don't like the mix but want to keep these same banks (rather than a full rerun)? Refresh
-  // every bank at once via random valid swaps — same mechanism as the per-bank ↻ button.
-  $('refreshAllBtn').addEventListener('click', () => refreshAllBanks());
-
   // ---------- editable arrangement helpers ----------
   function snapshotResult(result) {
     return {
@@ -1478,16 +1596,21 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       if (dupes.length) roundCollisions[p] = [...new Set(dupes)];
     }
     result.roundCollisions = roundCollisions;
+    // A repeated game can now land in more than two banks (see buildBanks), so track every
+    // occurrence (bank + round), not just a first/second pair.
     const dupFirstBank = {};
     const dupSecondBank = {};
+    const repeatOccurrences = {};
     result.repeats.forEach(name => {
-      const idxs = [];
-      result.banks.forEach((b, i) => { for (let p = 1; p <= b.size; p++) if (b.pos[p].name === name) idxs.push(i); });
-      dupFirstBank[name] = idxs[0];
-      dupSecondBank[name] = idxs[1];
+      const occ = [];
+      result.banks.forEach((b, i) => { for (let p = 1; p <= b.size; p++) if (b.pos[p].name === name) occ.push({ bank: i, round: p }); });
+      repeatOccurrences[name] = occ;
+      dupFirstBank[name] = occ[0] ? occ[0].bank : undefined; // kept for any older code path that still reads it
+      dupSecondBank[name] = occ[1] ? occ[1].bank : undefined;
     });
     result.dupFirstBank = dupFirstBank;
     result._dupSecondBank = dupSecondBank;
+    result.repeatOccurrences = repeatOccurrences;
   }
   function allSlotsFlat(result) {
     const flat = [];
@@ -1572,11 +1695,29 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return score;
   }
 
-  // Core of "refresh" — every slot in this bank gets swapped with a random, valid pick from
-  // elsewhere (never leaving the game pool, since every game already lives in some bank;
-  // "refreshing" one bank necessarily means trading with the rest). Skips a slot only if no
-  // safe swap exists for it. Split from refreshBank so refreshAllBanks can run this for every
-  // bank and only recompute/render once at the end, instead of once per bank.
+  // Weighted-random pick among valid swap candidates for slot (bankIndex, p), biased toward the
+  // candidates optionFitScore() likes best (the same era/time-balance scoring the balancer and
+  // the manual swap dropdown use) — rank the candidates best-to-worst by that score, then draw
+  // with weight 1/(rank+1). That keeps "refresh" balance-aware (it won't happily swap in a
+  // lopsided era/time mix) while still giving a different, usable result on repeated clicks
+  // instead of collapsing to the single "best" swap every time.
+  function pickWeightedSwapCandidate(result, bankIndex, p, candidates) {
+    const ranked = candidates
+      .map(c => ({ c, score: optionFitScore(result, bankIndex, p, { bi: c.bi, p: c.p, valid: true }) }))
+      .sort((a, b) => a.score - b.score);
+    const weights = ranked.map((_, i) => 1 / (i + 1));
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+    let r = Math.random() * totalWeight;
+    for (let i = 0; i < ranked.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return ranked[i].c;
+    }
+    return ranked[ranked.length - 1].c;
+  }
+  // Core of "refresh" — every slot in this bank gets swapped with a balance-aware, valid pick
+  // from elsewhere (never leaving the game pool, since every game already lives in some bank;
+  // "refreshing" one bank necessarily means trading with the rest). Skips a slot only if no safe
+  // swap exists for it.
   function refreshBankSlots(bankIndex) {
     const result = state.result;
     const size = result.banks[bankIndex].size;
@@ -1589,7 +1730,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         }
       });
       if (candidates.length === 0) continue;
-      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      const pick = pickWeightedSwapCandidate(result, bankIndex, p, candidates);
       swapSlots(result, { bi: bankIndex, p }, pick);
     }
   }
@@ -1599,17 +1740,10 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     $('resetEditsBtn').hidden = false;
     renderResults();
   }
-  // Don't like just one bank? Trade its games with other banks.
+  // Don't like just one bank? Trade its games with other banks, favoring good era/time fits —
+  // same idea as "Try another arrangement" but scoped to just this bank instead of a full rerun.
   function refreshBank(bankIndex) {
     refreshBankSlots(bankIndex);
-    markEditedAndRender();
-  }
-  // Don't like the mix in general, but want to keep this same set of banks (unlike "Try another
-  // arrangement", which reruns the balancer from scratch)? Refresh every bank at once — same
-  // random-valid-swap mechanism as the per-bank refresh, just applied to all of them in one go.
-  function refreshAllBanks() {
-    const result = state.result;
-    for (let bi = 0; bi < result.banks.length; bi++) refreshBankSlots(bi);
     markEditedAndRender();
   }
 
@@ -1704,19 +1838,16 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       repeatSection.hidden = true;
     } else {
       repeatSection.hidden = false;
-      $('repeatLastRoundHeader').textContent = 'Second bank';
       const tbody = $('repeatTableBody');
       tbody.innerHTML = '';
       for (const name of repeats) {
         const g = state.classified.find(x => x.name === name) || flatSlots.find(s => s.game.name === name).game;
-        const firstBankIdx = result.dupFirstBank[name];
-        const secondBankIdx = result._dupSecondBank ? result._dupSecondBank[name] : (() => {
-          let idx = -1;
-          banks.forEach((b, i) => { if (i !== firstBankIdx && b.games && b.games.some(x => x.name === name)) idx = i; });
-          return idx;
-        })();
+        // A game can now repeat into more than two banks when the pool is short enough — list
+        // every occurrence, sorted by round so the spacing is easy to read at a glance.
+        const occ = [...(result.repeatOccurrences[name] || [])].sort((a, b) => a.round - b.round);
+        const scheduledIn = occ.map(o => `Bank ${o.bank + 1} (Round ${o.round})`).join(', ');
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${name}</td><td>Bank ${firstBankIdx + 1}</td><td>Bank ${secondBankIdx + 1}</td><td class="num">${fmtSec(g.avgSec)}</td>`;
+        tr.innerHTML = `<td>${name}</td><td>${scheduledIn}</td><td class="num">${fmtSec(g.avgSec)}</td>`;
         tbody.appendChild(tr);
       }
     }
@@ -1788,12 +1919,42 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   $('resetEditsBtn').addEventListener('click', () => {
     if (!state.originalSnapshot) return;
     state.result = cloneSnapshot(state.originalSnapshot);
+    recomputeDerived(state.result); // repopulates repeatOccurrences etc., same as after any edit
     state.edited = false;
     $('resetEditsBtn').hidden = true;
     renderResults();
   });
 
-  $('printBtn').addEventListener('click', () => window.print());
+  // Print uses the exact same grid layout as the PDF/Word export (same column/font-fit code,
+  // same landscape page) — built into #printGrid right before the browser's print dialog opens,
+  // with everything else on the page hidden for print (see the @media print rules).
+  $('printBtn').addEventListener('click', () => {
+    renderPrintGrid();
+    window.print();
+  });
+  function renderPrintGrid() {
+    const banksData = getBankGridData();
+    const { contentWidthPt, tableBudgetPt } = exportPageLayout();
+    const cellPadPt = 5;
+    const { cols, fontSizePt } = pickBankGridLayout(banksData, contentWidthPt, cellPadPt, tableBudgetPt);
+    const cellWidthPct = (100 / cols).toFixed(4);
+    const rowsHtml = [];
+    for (let i = 0; i < banksData.length; i += cols) {
+      const rowBanks = banksData.slice(i, i + cols);
+      const cells = rowBanks.map(b => `
+        <td style="border:1px solid #999; padding:${cellPadPt}pt; vertical-align:top; width:${cellWidthPct}%;">
+          <div style="font-weight:700; font-size:${fontSizePt}pt; white-space:nowrap;">BANK ${b.index}</div>
+          ${b.names.map(n => `<div style="font-size:${fontSizePt}pt; white-space:nowrap;">${n}</div>`).join('')}
+        </td>`).join('');
+      rowsHtml.push(`<tr>${cells}</tr>`);
+    }
+    $('printGrid').innerHTML = `
+      <div style="font-family:Arial, sans-serif; color:#000; padding:40pt;">
+        <div style="font-weight:700; font-size:18pt;">Tournament Banks</div>
+        <div style="font-size:10pt; margin-bottom:10pt;">${banksData.length} banks &middot; ${state.bankSize} games each</div>
+        <table style="width:100%; border-collapse:collapse;">${rowsHtml.join('')}</table>
+      </div>`;
+  }
 
   // ---------- file downloads (Word / PDF) ----------
   // Two ways this page can save a file, auto-detected:
@@ -1806,9 +1967,29 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   let downloadMode = 'pending'; // 'pending' | 'capability' | 'plain' | 'unavailable'
   function updateDownloadButtons() {
     const show = downloadMode === 'capability' || downloadMode === 'plain';
-    $('downloadDocxBtn').hidden = !show;
-    $('downloadPdfBtn').hidden = !show;
+    $('exportBtn').hidden = !show;
+    if (!show) closeExportMenu();
   }
+  function closeExportMenu() {
+    $('exportMenu').hidden = true;
+    $('exportBtn').setAttribute('aria-expanded', 'false');
+  }
+  $('exportBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const willOpen = $('exportMenu').hidden;
+    if (willOpen) {
+      $('exportMenu').hidden = false;
+      $('exportBtn').setAttribute('aria-expanded', 'true');
+    } else {
+      closeExportMenu();
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (!$('exportMenu').hidden && !e.target.closest('.exportWrap')) closeExportMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('exportMenu').hidden) closeExportMenu();
+  });
   if (window.claude && typeof window.claude.use === 'function') {
     window.claude.use('downloads')
       .then(ns => {
@@ -2020,7 +2201,8 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return doc.output('blob');
   }
 
-  $('downloadDocxBtn').addEventListener('click', async () => {
+  $('exportDocxBtn').addEventListener('click', async () => {
+    closeExportMenu();
     if (downloadMode !== 'capability' && downloadMode !== 'plain') return;
     showDownloadMsg('');
     try {
@@ -2032,7 +2214,8 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     }
   });
 
-  $('downloadPdfBtn').addEventListener('click', async () => {
+  $('exportPdfBtn').addEventListener('click', async () => {
+    closeExportMenu();
     if (downloadMode !== 'capability' && downloadMode !== 'plain') return;
     showDownloadMsg('');
     try {
