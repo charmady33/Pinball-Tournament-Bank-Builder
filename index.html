@@ -513,6 +513,23 @@ function fmtSec(s) {
   return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
+// Every game's working average time gets rounded to the nearest ROUND_TO_MINUTES-minute mark
+// (5 min floor, so a very short manual entry never rounds down to 0) before it's used for
+// anything — deciding which bank a game lands in, how banks get balanced, or how times are
+// shown. Real play times vary run to run anyway, so exact-to-the-second averages were false
+// precision: two games 8 seconds apart would out-rank each other in the balancer's scoring the
+// same as two games 8 minutes apart, letting meaningless timing noise outweigh factors like era
+// variety when the balancer had to pick between near-identical options. Rounding to a clean
+// 5-minute grid removes that noise and gives the balancer (and the person reading the schedule)
+// round, comparable numbers to work with instead.
+const ROUND_TO_MINUTES = 5;
+function roundGameTime(sec) {
+  const minutes = sec / 60;
+  let rounded = Math.round(minutes / ROUND_TO_MINUTES) * ROUND_TO_MINUTES;
+  if (rounded < ROUND_TO_MINUTES) rounded = ROUND_TO_MINUTES;
+  return rounded * 60;
+}
+
 // Parse pasted tab/comma-separated rows: name, avg, min, max, count
 function parseRows(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
@@ -1337,6 +1354,10 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     for (const g of games) {
       if (state.timeOverride[g.name] !== undefined) g.avgSec = state.timeOverride[g.name];
     }
+    // Round every game's working time to a clean 5-minute mark — see roundGameTime in logic.js —
+    // so the balancer (and the Game list, and every other place a time is shown) works from the
+    // same rounded number, not the exact-to-the-second average.
+    for (const g of games) g.avgSec = roundGameTime(g.avgSec);
     state.workingGames = games;
   }
 
