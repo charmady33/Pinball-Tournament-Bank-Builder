@@ -563,14 +563,22 @@ const ERA_ORDER = ['EM', 'SS', 'DMD', 'Modern'];
 const ERA_MAX_DIST = ERA_ORDER.length - 1; // 3 (EM <-> Modern)
 
 // Cost of putting two games of these eras in the same bank: 0 for the farthest-apart pairing
-// (e.g. EM + Modern), rising as eras get closer together, and a hard, dominant penalty for the
-// exact same era (so "avoid same era" always wins over "prefer far apart" when they conflict).
+// (e.g. EM + Modern), rising as eras get closer together, worst of all for the exact same era —
+// but "worst" here means the worst point on the SAME scale, not an infinite wall. Same-era used
+// to be priced at 1e6, effectively forbidding it outright even when the only alternative was
+// forcing a scarce era (e.g. the one Modern game in a mostly-SS pool) into a cramped pairing
+// instead. Pricing it a fixed, finite step below the farthest-apart pairing's cost still makes it
+// the single worst pairwise choice — nothing ever prefers two same-era games over any distinct
+// pairing on its own — but lets the balancer make an honest trade: accepting one same-era pair
+// is only ever chosen when it frees up enough OTHER pairs to move further apart that the total
+// spread genuinely improves, never as a casual substitute for a free fix.
+const SAME_ERA_PENALTY = 750;
 function eraPairPenalty(era1, era2) {
   if (era1 === 'Custom' || era1 === 'Unknown' || era2 === 'Custom' || era2 === 'Unknown') return 0;
   const i1 = ERA_ORDER.indexOf(era1), i2 = ERA_ORDER.indexOf(era2);
   if (i1 === -1 || i2 === -1) return 0;
   const dist = Math.abs(i1 - i2);
-  if (dist === 0) return 1e6; // same era — hard avoid, as before
+  if (dist === 0) return SAME_ERA_PENALTY;
   return (ERA_MAX_DIST - dist) * 300; // adjacent eras (dist 1) cost more than far-apart ones
 }
 
@@ -952,6 +960,15 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     }
     return era; // null if no era repeats within this bank
   }
+  // A same-era clash gets fixed only when a fix is actually a net improvement in total era
+  // spread — never unconditionally. With SAME_ERA_PENALTY now finite (not an infinite wall),
+  // "fix this clash no matter what" would fight the balancer's own honest trade-offs: sometimes
+  // the only way to clear one bank's clash is to force a scarce era (say, the one Modern game in
+  // a mostly-SS pool) into a cramped pairing somewhere else, which can cost more in total spread
+  // than just leaving the original clash in place. So every candidate swap is scored by the
+  // actual before/after change in combined era penalty across both banks, and only ever taken
+  // when that's a real reduction — a clash that truly can't be improved on is left as the
+  // genuinely best-available arrangement, not force-fixed at a worse cost elsewhere.
   let repairPasses = 0;
   let anyClash = banks.some(b => worstEraClash(b.games) !== null);
   while (anyClash && repairPasses < 50) {
@@ -960,9 +977,11 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     for (let i = 0; i < numBanks; i++) {
       const targetEra = worstEraClash(banks[i].games);
       if (targetEra === null) continue;
-      let bestDelta = Infinity, bestSwap = null;
+      let bestScore = Infinity, bestSwap = null;
+      const beforePenalty = bankEraPenalty(banks[i].games);
       for (let j = 0; j < numBanks; j++) {
         if (i === j) continue;
+        const beforeJ = bankEraPenalty(banks[j].games);
         for (let pi = 0; pi < banks[i].games.length; pi++) {
           const gi = banks[i].games[pi];
           if (gi.era !== targetEra) continue; // only relocate one of the clustered-era games
@@ -976,13 +995,15 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             if (otherINames.includes(gj.name) || otherJNames.includes(gi.name)) continue;
             const iGamesAfter = banks[i].games.map((g, k) => (k === pi ? gj : g));
             const jGamesAfter = banks[j].games.map((g, k) => (k === pj ? gi : g));
-            // check this doesn't create or worsen a clash in bank j
-            if (worstEraClash(jGamesAfter) !== null) continue;
-            // Prefer the smallest time disruption, but among close options favor one that also
-            // spreads eras further apart (e.g. picking an EM over an SS to pair with a Modern).
-            const eraPenaltyAfter = bankEraPenalty(iGamesAfter) + bankEraPenalty(jGamesAfter);
-            const score = Math.abs(gi.avgSec - gj.avgSec) + eraPenaltyAfter * 0.05;
-            if (score < bestDelta) { bestDelta = score; bestSwap = { j, pi, pj }; }
+            const afterPenalty = bankEraPenalty(iGamesAfter) + bankEraPenalty(jGamesAfter);
+            // Only a genuine net improvement in combined era spread counts as a fix — a swap
+            // that clears bank i's clash by creating an equally- or more-costly one in bank j
+            // (or elsewhere down the line) is not an improvement and is left alone.
+            if (afterPenalty >= beforePenalty + beforeJ - 1e-9) continue;
+            // Among genuine improvements, prefer the smallest time disruption, with a small
+            // preference for whichever leaves the lowest absolute era cost behind.
+            const score = Math.abs(gi.avgSec - gj.avgSec) + afterPenalty * 0.05;
+            if (score < bestScore) { bestScore = score; bestSwap = { j, pi, pj }; }
           }
         }
       }
