@@ -828,8 +828,64 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     }
   }
 
-  // swap-optimize (balance totals) among non-repeated games only
-  function swappable(e) { return !repeats.includes(e.name); }
+  // The greedy placement above can, in rare severe-deficit configurations, run out of banks
+  // that both have room AND don't already hold this exact game — every bank that still has a
+  // free slot already contains this name. When that happens the fallback above has no choice
+  // but to place a second copy into a bank that already has one, silently breaking the "never
+  // twice in the same bank" invariant that everything downstream (round assignment, exports)
+  // depends on. Clean that up now by trading the extra copy with a game from another bank that
+  // neither already holds.
+  function fixSameBankDuplicates() {
+    let guard = 0;
+    while (guard < 200) {
+      guard++;
+      let dupeBank = -1, dupeName = null, dupeIndexes = null;
+      for (let bi = 0; bi < numBanks && dupeBank === -1; bi++) {
+        const seen = {};
+        banks[bi].games.forEach((g, k) => { (seen[g.name] = seen[g.name] || []).push(k); });
+        for (const n of Object.keys(seen)) {
+          if (seen[n].length > 1) { dupeBank = bi; dupeName = n; dupeIndexes = seen[n]; break; }
+        }
+      }
+      if (dupeBank === -1) return true; // nothing left to fix
+      let fixed = false;
+      for (let idx = 1; idx < dupeIndexes.length && !fixed; idx++) { // keep the first instance, relocate the rest
+        const k = dupeIndexes[idx];
+        const extra = banks[dupeBank].games[k];
+        for (let bj = 0; bj < numBanks && !fixed; bj++) {
+          if (bj === dupeBank) continue;
+          for (let m = 0; m < banks[bj].games.length; m++) {
+            const other = banks[bj].games[m];
+            if (other.name === dupeName) continue; // would just recreate the duplicate over there
+            if (banks[dupeBank].games.some((g, gi) => gi !== k && g.name === other.name)) continue; // new duplicate in dupeBank
+            if (banks[bj].games.some((g, gi) => gi !== m && g.name === extra.name)) continue; // new duplicate in bj
+            banks[dupeBank].games[k] = other;
+            banks[bj].games[m] = extra;
+            banks[dupeBank].total += other.avgSec - extra.avgSec;
+            banks[bj].total += extra.avgSec - other.avgSec;
+            banks[dupeBank].eras = new Set(banks[dupeBank].games.map(g => g.era));
+            banks[bj].eras = new Set(banks[bj].games.map(g => g.era));
+            fixed = true;
+            break;
+          }
+        }
+      }
+      if (!fixed) return false; // structurally unavoidable — extremely rare
+    }
+    return false;
+  }
+  if (!fixSameBankDuplicates()) {
+    throw new Error('Could not build a valid arrangement with this many games, banks, and target size — try fewer banks, a smaller target size, or add more games.');
+  }
+
+  // swap-optimize (balance totals) and era-diversity repair both operate on ANY game, repeats
+  // included — the duplicate-safety check each swap already does (a game can't land in a bank
+  // that already holds it) works the same regardless of repeat status, and round/timing
+  // assignment for repeats happens later, from whatever bank membership these passes settle on.
+  // Excluding repeats here used to leave real, avoidable same-era clustering on the table
+  // whenever the games left over to balance/diversify happened to include a repeat — e.g. two SS
+  // games stuck sharing a bank while a repeat EM game elsewhere could have swapped in instead.
+  function swappable() { return true; }
   let improved = true, passes = 0;
   while (improved && passes < 300) {
     improved = false; passes++;
@@ -876,26 +932,40 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     }
   }
 
-  // era-diversity repair pass: fix any bank left with all games in the same era
-  function isSingleEra(b) {
-    if (b.games.length < 2) return false;
-    const eras = b.games.map(g => g.era).filter(e => e !== 'Unknown' && e !== 'Custom');
-    if (eras.length < b.games.length) return false; // has an exempt game, don't force
-    return new Set(eras).size === 1;
+  // era-diversity repair pass: fix any bank still holding an avoidable same-era cluster —
+  // two or more games of the SAME real era, whether or not that's every game in the bank.
+  // Unknown/Custom carry no chronology so they're never counted toward a clash and never
+  // targeted for removal — but (the bug this replaces) a bank that merely CONTAINS one of
+  // those exempt games used to be skipped entirely, even when its other games were badly
+  // clustered (e.g. two SS games plus one Unknown, left untouched because the Unknown made
+  // the bank "not single-era"). Counting clashes per-era instead of requiring the whole bank
+  // to match fixes that: the exempt game no longer shields the rest of the bank from repair.
+  function worstEraClash(games) {
+    const counts = {};
+    for (const g of games) {
+      if (g.era === 'Unknown' || g.era === 'Custom') continue;
+      counts[g.era] = (counts[g.era] || 0) + 1;
+    }
+    let era = null, count = 1;
+    for (const e of Object.keys(counts)) {
+      if (counts[e] > count) { count = counts[e]; era = e; }
+    }
+    return era; // null if no era repeats within this bank
   }
   let repairPasses = 0;
-  let anySingle = banks.some(isSingleEra);
-  while (anySingle && repairPasses < 50) {
+  let anyClash = banks.some(b => worstEraClash(b.games) !== null);
+  while (anyClash && repairPasses < 50) {
     repairPasses++;
-    anySingle = false;
+    anyClash = false;
     for (let i = 0; i < numBanks; i++) {
-      if (!isSingleEra(banks[i])) continue;
-      const targetEra = banks[i].games[0].era;
+      const targetEra = worstEraClash(banks[i].games);
+      if (targetEra === null) continue;
       let bestDelta = Infinity, bestSwap = null;
       for (let j = 0; j < numBanks; j++) {
         if (i === j) continue;
         for (let pi = 0; pi < banks[i].games.length; pi++) {
           const gi = banks[i].games[pi];
+          if (gi.era !== targetEra) continue; // only relocate one of the clustered-era games
           if (!swappable(gi)) continue;
           for (let pj = 0; pj < banks[j].games.length; pj++) {
             const gj = banks[j].games[pj];
@@ -906,10 +976,8 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             if (otherINames.includes(gj.name) || otherJNames.includes(gi.name)) continue;
             const iGamesAfter = banks[i].games.map((g, k) => (k === pi ? gj : g));
             const jGamesAfter = banks[j].games.map((g, k) => (k === pj ? gi : g));
-            // check this doesn't create a NEW single-era bank j
-            const jErasAfter = jGamesAfter.map(g => g.era);
-            const jExempt = jErasAfter.some(e => e === 'Unknown' || e === 'Custom');
-            if (!jExempt && new Set(jErasAfter).size === 1) continue;
+            // check this doesn't create or worsen a clash in bank j
+            if (worstEraClash(jGamesAfter) !== null) continue;
             // Prefer the smallest time disruption, but among close options favor one that also
             // spreads eras further apart (e.g. picking an EM over an SS to pair with a Modern).
             const eraPenaltyAfter = bankEraPenalty(iGamesAfter) + bankEraPenalty(jGamesAfter);
@@ -926,7 +994,7 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
         banks[j].total = banks[j].total - gj.avgSec + gi.avgSec;
         banks[i].eras = new Set(banks[i].games.map(g => g.era));
         banks[j].eras = new Set(banks[j].games.map(g => g.era));
-        anySingle = true;
+        anyClash = true;
       }
     }
   }
@@ -1581,8 +1649,14 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (genOpts.perturb) {
       result = cloneSnapshot(state.idealSnapshot);
       recomputeDerived(result);
-      perturbIncludedSet(result);
-      perturbArrangement(result);
+      // The longest bank's total is what actually decides how long the whole event runs — that's
+      // the number to protect. "Try another arrangement" is free to be a genuinely different mix,
+      // but it shouldn't be free to make the event longer than it has to be: every perturbation
+      // step below is bounded so it doesn't push any bank's total far past what the ideal
+      // arrangement's longest bank already totals.
+      const idealMaxTotal = Math.max(...idealResult.banks.map(b => b.total));
+      perturbIncludedSet(result, idealMaxTotal);
+      perturbArrangement(result, idealMaxTotal);
       recomputeDerived(result);
     }
 
@@ -1683,10 +1757,19 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     result.banks.forEach((b, bi) => { for (let p = 1; p <= b.size; p++) flat.push({ bi, p, game: b.pos[p] }); });
     return flat;
   }
+  // Keeps .total in sync on every swap (not just position). Several callers — the per-bank
+  // refresh, "Try another arrangement"'s budget check — read a bank's .total to make its very
+  // NEXT decision within the same pass; if this didn't update it, those reads would go stale
+  // after the first swap and any budget/balance math built on them would silently drift.
   function swapSlots(result, a, b2) {
-    const tmp = result.banks[a.bi].pos[a.p];
-    result.banks[a.bi].pos[a.p] = result.banks[b2.bi].pos[b2.p];
-    result.banks[b2.bi].pos[b2.p] = tmp;
+    const gameA = result.banks[a.bi].pos[a.p];
+    const gameB = result.banks[b2.bi].pos[b2.p];
+    result.banks[a.bi].pos[a.p] = gameB;
+    result.banks[b2.bi].pos[b2.p] = gameA;
+    if (a.bi !== b2.bi) {
+      result.banks[a.bi].total += gameB.avgSec - gameA.avgSec;
+      result.banks[b2.bi].total += gameA.avgSec - gameB.avgSec;
+    }
   }
 
   // Would swapping slot a with slot b2 be safe? Two things can go wrong: the incoming game
@@ -1740,15 +1823,26 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return true;
   }
 
+  // How much "Try another arrangement" is allowed to raise the longest bank's total over the
+  // ideal arrangement's longest bank — the real bottleneck for how long the whole event runs.
+  // Keeping the max low is the actual goal; a shuffle earns its variety by staying inside this
+  // budget, not by ignoring it.
+  const MAX_TOTAL_TOLERANCE_FRACTION = 0.06;
+
   // "Try another arrangement" starts from the ideal, best-balanced layout and nudges it — one
-  // random valid swap per bank, where a safe one exists — so the result is genuinely different
-  // to look at instead of risking the balancer's own swap-optimize pass reconverging to the same
-  // grouping it would've built anyway. Deliberately NOT weighted toward the best-scoring
-  // candidate the way the per-bank refresh is — that would just rebuild something close to
-  // ideal again — this is meant to be visibly different, not another attempt at "best".
-  function perturbArrangement(result) {
+  // valid swap per bank, where a safe one exists — so the result is genuinely different to look
+  // at instead of risking the balancer's own swap-optimize pass reconverging to the same
+  // grouping it would've built anyway. It's not weighted toward the single best-scoring
+  // candidate the way the per-bank refresh is — that would just rebuild something close to ideal
+  // again — but it IS bounded: every candidate is scored by the worse of the two banks' totals
+  // it would produce, and only candidates that keep that within budget of idealMaxTotal are
+  // considered — a position with nothing in-budget is simply skipped rather than forced through
+  // with the least-bad option, so "different" never means "the event runs a lot longer than it
+  // needs to."
+  function perturbArrangement(result, idealMaxTotal) {
     const numBanks = result.banks.length;
     if (numBanks < 2) return false;
+    const tolerance = idealMaxTotal * MAX_TOTAL_TOLERANCE_FRACTION;
     const bankOrder = Array.from({ length: numBanks }, (_, i) => i);
     for (let i = bankOrder.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1771,7 +1865,16 @@ Dracula\t23:47\t23:47\t23:47\t1`;
           }
         });
         if (candidates.length === 0) continue;
-        const pick = candidates[Math.floor(Math.random() * candidates.length)]; // plain random — not weighted toward "best"
+        const scored = candidates.map(c => {
+          const bankA = result.banks[bankIndex], bankB = result.banks[c.bi];
+          const gameA = bankA.pos[p], gameB = bankB.pos[c.p];
+          const newTotalA = bankA.total - gameA.avgSec + gameB.avgSec;
+          const newTotalB = bankB.total - gameB.avgSec + gameA.avgSec;
+          return { c, resultingMax: Math.max(newTotalA, newTotalB) };
+        });
+        const within = scored.filter(s => s.resultingMax <= idealMaxTotal + tolerance);
+        if (!within.length) continue; // nothing here stays in budget — try another position in this bank instead
+        const pick = within[Math.floor(Math.random() * within.length)].c; // random WITHIN budget — still not "always best"
         swapSlots(result, { bi: bankIndex, p }, pick);
         changedAny = true;
         break; // one swap is enough to make this bank visibly different; move on to the next
@@ -1785,10 +1888,12 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // up its own longest-average games first) — without this, a game that always wins that cut (or
   // always loses it) would look "stuck" no matter how many times you shuffle. Swap a few held-out
   // games back in for currently-included, non-repeated games before rearranging rounds/banks,
-  // preferring a same-era swap so the era balance the settings asked for doesn't drift.
-  function perturbIncludedSet(result) {
+  // preferring a same-era swap so the era balance the settings asked for doesn't drift — and,
+  // same as above, bounded so bringing a game back in can't blow up the longest bank's total.
+  function perturbIncludedSet(result, idealMaxTotal) {
     const dropped = result.droppedGames || [];
     if (!dropped.length) return false;
+    const tolerance = idealMaxTotal * MAX_TOTAL_TOLERANCE_FRACTION;
     const shuffled = [...dropped];
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1800,8 +1905,14 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       const incoming = shuffled[i];
       const includedSlots = allSlotsFlat(result).filter(s => !result.repeats.includes(s.game.name));
       if (!includedSlots.length) break;
+      const resultingTotal = s => result.banks[s.bi].total - result.banks[s.bi].pos[s.p].avgSec + incoming.avgSec;
+      const withinBudget = s => resultingTotal(s) <= idealMaxTotal + tolerance;
       const sameEra = includedSlots.filter(s => s.game.era === incoming.era);
-      const pool = sameEra.length ? sameEra : includedSlots;
+      // Prefer a same-era, in-budget slot; widen to any era if that's empty; skip this held-out
+      // game this round (rather than force an over-budget swap) if nothing qualifies at all.
+      let pool = sameEra.filter(withinBudget);
+      if (!pool.length) pool = includedSlots.filter(withinBudget);
+      if (!pool.length) continue;
       const target = pool[Math.floor(Math.random() * pool.length)];
       const outgoing = result.banks[target.bi].pos[target.p];
       result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null };
@@ -1984,20 +2095,27 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         const isRepeat = repeats.includes(g.name);
         const isCollision = isRepeat && roundCollisions && roundCollisions[p] && roundCollisions[p].includes(g.name);
         const slotId = `${bi}-${p}`;
-        // Every game is offered — nothing is hidden. An option that would create a duplicate
-        // within a bank or a new round collision (the same game already scheduled for this
-        // round in some other bank) is still selectable, just flagged "conflicts" so the user
-        // can make an informed call. Sorted best fit to worst: era spread + time balance +
-        // repeat-count all factor in (see optionFitScore), and any conflicting option always
-        // sorts after every non-conflicting one, regardless of how good its other numbers look.
-        const options = state.editMode
-          ? flatSlots
-              .map(s => ({ ...s, valid: (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p }) }))
-              .sort((x, y) => optionFitScore(result, bi, p, x) - optionFitScore(result, bi, p, y))
-          : [];
+        // Every ACTIVE game is offered — not just the ones currently occupying a slot, but every
+        // game from the originally-reviewed pool, including anything currently held out for lack
+        // of room. Nothing is hidden: an option that would create a duplicate within a bank or a
+        // new round collision (the same game already scheduled for this round in some other
+        // bank) is still selectable, just flagged "conflicts" so the user can make an informed
+        // call. Sorted best fit to worst: era spread + time balance + repeat-count all factor in
+        // (see optionFitScore/insertFitScore), and any conflicting option always sorts after
+        // every non-conflicting one, regardless of how good its other numbers look.
+        const slotOptions = flatSlots.map(s => {
+          const valid = (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p });
+          return { kind: 'slot', bi: s.bi, p: s.p, game: s.game, valid, selected: s.bi === bi && s.p === p, score: optionFitScore(result, bi, p, { bi: s.bi, p: s.p, valid }) };
+        });
+        const dropOptions = (result.droppedGames || []).map((g, idx) => {
+          let valid = true;
+          for (let pp = 1; pp <= b.size; pp++) { if (pp !== p && b.pos[pp].name === g.name) { valid = false; break; } }
+          return { kind: 'drop', idx, game: g, valid, selected: false, score: insertFitScore(result, bi, p, g) + (valid ? 0 : CONFLICT_PENALTY) };
+        });
+        const options = state.editMode ? [...slotOptions, ...dropOptions].sort((x, y) => x.score - y.score) : [];
         const swapControl = state.editMode ? `
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
-              ${options.map(s => `<option value="${s.bi}-${s.p}" ${s.bi === bi && s.p === p ? 'selected' : ''}${s.valid ? '' : ' style="color:#b45309;"'}>${s.game.name} — ${fmtSec(s.game.avgSec)}${s.valid ? '' : ' — conflicts'}</option>`).join('')}
+              ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${o.valid ? '' : ' style="color:#b45309;"'}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${o.valid ? '' : ' — conflicts'}</option>`).join('')}
             </select>` : '';
         slots.push(`
           <div class="slot">
@@ -2024,9 +2142,23 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       list.querySelectorAll('select.swapSelect').forEach(sel => {
         sel.addEventListener('change', (e) => {
           const bi = parseInt(sel.dataset.bi, 10), p = parseInt(sel.dataset.p, 10);
-          const [tbi, tp] = e.target.value.split('-').map(Number);
-          if (tbi === bi && tp === p) return;
-          swapSlots(state.result, { bi, p }, { bi: tbi, p: tp });
+          const val = e.target.value;
+          if (val.startsWith('drop:')) {
+            const idx = parseInt(val.slice(5), 10);
+            const incoming = state.result.droppedGames[idx];
+            if (!incoming) return;
+            const bank = state.result.banks[bi];
+            const outgoing = bank.pos[p];
+            bank.pos[p] = { ...incoming, dupInstance: null };
+            bank.total += incoming.avgSec - outgoing.avgSec;
+            state.result.droppedGames = state.result.droppedGames.filter((g, i) => i !== idx);
+            state.result.droppedGames.push(outgoing);
+            recomputeRepeats(state.result);
+          } else {
+            const [tbi, tp] = val.slice(5).split('-').map(Number);
+            if (tbi === bi && tp === p) return;
+            swapSlots(state.result, { bi, p }, { bi: tbi, p: tp });
+          }
           recomputeDerived(state.result);
           state.edited = true;
           $('resetEditsBtn').hidden = false;
