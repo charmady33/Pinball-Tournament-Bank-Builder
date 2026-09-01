@@ -218,8 +218,10 @@ tr:last-child td{border-bottom:none;}
 
 .bankCard{border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:12px; background:var(--panel-2);}
 .bankCard .head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px;}
+.bankCard .head .labelWrap{display:flex; align-items:center; gap:6px;}
 .bankCard .head .label{font-family:'Kanit',sans-serif; font-weight:600; font-size:15px;}
 .bankCard .head .total{font-family:'IBM Plex Mono',monospace; color:var(--ink-soft); font-size:13px;}
+.bankRefreshBtn{padding:2px 8px; font-size:13px; line-height:1.4; border-radius:8px;}
 .bankGrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px;}
 .slot{background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px;}
 .slot .pos{font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-soft); margin-bottom:4px;}
@@ -436,6 +438,7 @@ Medieval Madness	35:56	18:00	1:01:49	16
     </div>
 
     <div class="actions no-print">
+      <button class="ghost" id="shuffleBtn" type="button" title="Rerun the balancer for a different valid arrangement">↻ Try another arrangement</button>
       <button class="ghost" id="editBanksBtn" type="button">Edit banks</button>
       <button class="ghost" id="resetEditsBtn" type="button" hidden>Reset to auto-generated</button>
       <button class="ghost" id="downloadDocxBtn" type="button" hidden>Download Word (.docx)</button>
@@ -655,6 +658,20 @@ function applyForcedIncludes(kept, dropped, forcedNames) {
   return { kept, dropped, failed };
 }
 
+// Deterministic seeded PRNG (mulberry32) — used only when opts.seed is provided, so the
+// default behavior (no seed) stays exactly as before: fully deterministic, ties always broken
+// the same way. Giving it a seed lets the caller ask for a different, still-valid arrangement
+// (ties get broken randomly instead) without touching the no-seed code path at all.
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // Core bank-building algorithm
 // games: [{name, avgSec, era}]
 // numBanks, bankSize — bankSize is a HARD constraint: every bank always has exactly this
@@ -669,6 +686,7 @@ function applyForcedIncludes(kept, dropped, forcedNames) {
 //     specific games, or pass opts.forceInclude (names that must make it into the banks —
 //     the algorithm automatically bumps a different game out to compensate).
 function buildBanks(games, numBanks, bankSize, opts = {}) {
+  const rng = opts.seed !== undefined && opts.seed !== null ? makeRng(opts.seed) : null;
   const targetSlots = numBanks * bankSize;
   let pool = [...games];
   let repeats = [];
@@ -717,8 +735,18 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     total: 0, games: [], eras: new Set(), posUsed: new Set(), size: bankSizes[i],
   }));
 
+  // With a seed, shuffle first so the LPT sort's ties (equal avgSec) land in random relative
+  // order — Array.sort is stable, so strictly-different times still sort correctly regardless.
+  const entriesForSort = [...entries];
+  if (rng) {
+    for (let i = entriesForSort.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [entriesForSort[i], entriesForSort[j]] = [entriesForSort[j], entriesForSort[i]];
+    }
+  }
+
   const dupFirstBank = {};
-  const entriesSorted = [...entries].sort((a, b) => b.avgSec - a.avgSec); // LPT
+  const entriesSorted = entriesForSort.sort((a, b) => b.avgSec - a.avgSec); // LPT
 
   function bankScore(b, e) {
     let penalty = 0;
@@ -738,11 +766,17 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
       candidates.push(i);
     }
     if (candidates.length === 0) candidates = [...Array(numBanks).keys()].filter(i => banks[i].games.length < banks[i].size);
-    let best = candidates[0], bestScore = Infinity;
+    // Collect every candidate tied for the best (lowest) score, then pick among them — with no
+    // seed this always picks the first one, identical to the old strictly-first-wins behavior.
+    let bestScore = Infinity, bestCandidates = [];
     for (const i of candidates) {
       const sc = bankScore(banks[i], e);
-      if (sc < bestScore) { bestScore = sc; best = i; }
+      if (sc < bestScore - 1e-9) { bestScore = sc; bestCandidates = [i]; }
+      else if (Math.abs(sc - bestScore) <= 1e-9) { bestCandidates.push(i); }
     }
+    const best = rng && bestCandidates.length > 1
+      ? bestCandidates[Math.floor(rng() * bestCandidates.length)]
+      : bestCandidates[0];
     banks[best].games.push(e);
     banks[best].total += e.avgSec;
     banks[best].eras.add(e.era);
@@ -960,6 +994,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     editMode: false,
     numBanks: null,
     bankSize: null,
+    seed: undefined,        // undefined = deterministic; set by "Try another arrangement" for a different valid mix
   };
 
   const overrides = safeGet(LS_OVERRIDES) || {}; // normKey -> era string or year number
@@ -1355,7 +1390,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     let result;
     try {
       const forced = Object.keys(state.forceInclude).filter(n => state.forceInclude[n]);
-      result = buildBanks(state.classified, numBanks, bankSize, { forceInclude: forced, eraBalance });
+      result = buildBanks(state.classified, numBanks, bankSize, { forceInclude: forced, eraBalance, seed: state.seed });
     } catch (err) {
       $('settingsWarning').hidden = false;
       $('settingsWarning').classList.add('warn'); $('settingsWarning').classList.remove('good');
@@ -1393,6 +1428,14 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (!runGenerate()) return;
     setStepPill(4);
     $('resultsCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+
+  // Don't like this arrangement? Rerun the balancer with a new random seed — still balanced
+  // (time, era spread, everything else) but breaks ties differently, so it's a genuinely
+  // different valid arrangement rather than a random mess. Same settings, same games.
+  $('shuffleBtn').addEventListener('click', () => {
+    state.seed = Math.floor(Math.random() * 2 ** 31);
+    runGenerate();
   });
 
   // ---------- editable arrangement helpers ----------
@@ -1452,6 +1495,91 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     result.banks[b2.bi].pos[b2.p] = tmp;
   }
 
+  // Would swapping slot a with slot b2 be safe? Two things can go wrong: the incoming game
+  // could already exist elsewhere in the bank it's moving into (a duplicate within one bank),
+  // or it could already be scheduled for the same round in some other bank (a round collision —
+  // the same thing the "Some games are scheduled in the same round across banks" warning
+  // flags). Used both to filter the manual swap dropdown down to genuinely safe choices, and to
+  // pick safe random swaps for the per-bank/whole-arrangement refresh buttons.
+  function isValidSwapTarget(result, a, b2) {
+    if (a.bi === b2.bi && a.p === b2.p) return true; // "no change" — always fine
+    const gameA = result.banks[a.bi].pos[a.p];
+    const gameB = result.banks[b2.bi].pos[b2.p];
+    // No duplicate within either affected bank (skip the check when it's the same bank —
+    // reordering within one bank can never introduce a same-bank duplicate).
+    if (a.bi !== b2.bi) {
+      const bankA = result.banks[a.bi], bankB = result.banks[b2.bi];
+      let dupInA = false, dupInB = false;
+      for (let p = 1; p <= bankA.size; p++) { if (p !== a.p && bankA.pos[p].name === gameB.name) dupInA = true; }
+      for (let p = 1; p <= bankB.size; p++) { if (p !== b2.p && bankB.pos[p].name === gameA.name) dupInB = true; }
+      if (dupInA || dupInB) return false;
+    }
+    // No new round collision in either affected round.
+    const rounds = a.p === b2.p ? [a.p] : [a.p, b2.p];
+    for (const round of rounds) {
+      const names = [];
+      result.banks.forEach((bank, i) => {
+        if (round > bank.size) return;
+        let name;
+        if (i === a.bi && round === a.p) name = gameB.name;
+        else if (i === b2.bi && round === b2.p) name = gameA.name;
+        else name = bank.pos[round].name;
+        names.push(name);
+      });
+      if (new Set(names).size !== names.length) return false;
+    }
+    return true;
+  }
+
+  // How good a fit is candidate slot s if swapped into slot (bi, p)? Lower = better fit.
+  // Mirrors the same "totals variance + era penalty" scoring the balancer itself uses when
+  // deciding whether a swap is worth making (see the swap-optimize pass in logic.js), so the
+  // dropdown's best-to-worst ordering reflects the same notion of "fits well" as the rest of
+  // the tool. A swap within the very same bank never changes that bank's game lineup (only
+  // which round each game lands in), so it can't affect era spread or bank totals — those
+  // options score 0 and float to the top alongside "no change".
+  function optionFitScore(result, bi, p, s) {
+    if (s.bi === bi) return 0;
+    const bankA = result.banks[bi], bankB = result.banks[s.bi];
+    const gameA = bankA.pos[p], gameB = bankB.pos[s.p];
+    const newTotalA = bankA.total - gameA.avgSec + gameB.avgSec;
+    const newTotalB = bankB.total - gameB.avgSec + gameA.avgSec;
+    const mean = (bankA.total + bankB.total) / 2;
+    const newVar = (newTotalA - mean) ** 2 + (newTotalB - mean) ** 2;
+    function gamesAfterSwap(bank, posToReplace, replacement) {
+      const arr = [];
+      for (let pp = 1; pp <= bank.size; pp++) arr.push(pp === posToReplace ? replacement : bank.pos[pp]);
+      return arr;
+    }
+    const newEraPenalty = bankEraPenalty(gamesAfterSwap(bankA, p, gameB)) + bankEraPenalty(gamesAfterSwap(bankB, s.p, gameA));
+    return newVar + newEraPenalty;
+  }
+
+  // Don't like just one bank? Trade its games with other banks — every slot in this bank gets
+  // swapped with a random, valid pick from elsewhere (never leaving the game pool, since every
+  // game already lives in some bank; "refreshing" one bank necessarily means trading with the
+  // rest). Skips a slot only if no safe swap exists for it.
+  function refreshBank(bankIndex) {
+    const result = state.result;
+    const size = result.banks[bankIndex].size;
+    for (let p = 1; p <= size; p++) {
+      const candidates = [];
+      result.banks.forEach((b, bi) => {
+        if (bi === bankIndex) return;
+        for (let tp = 1; tp <= b.size; tp++) {
+          if (isValidSwapTarget(result, { bi: bankIndex, p }, { bi, p: tp })) candidates.push({ bi, p: tp });
+        }
+      });
+      if (candidates.length === 0) continue;
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      swapSlots(result, { bi: bankIndex, p }, pick);
+    }
+    recomputeDerived(result);
+    state.edited = true;
+    $('resetEditsBtn').hidden = false;
+    renderResults();
+  }
+
   // ---------- RESULTS ----------
   function renderResults() {
     const result = state.result;
@@ -1472,6 +1600,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     }
 
     const flatSlots = allSlotsFlat(result);
+    const timeTh = computeTimeThresholds(state.classified.length ? state.classified : flatSlots.map(s => s.game));
     const list = $('bankList');
     list.innerHTML = '';
     banks.forEach((b, bi) => {
@@ -1482,9 +1611,18 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         const g = b.pos[p];
         const isRepeat = repeats.includes(g.name);
         const slotId = `${bi}-${p}`;
+        // Only offer swaps that stay valid: no duplicate game within a bank, and no new round
+        // collision (a game already scheduled for this same round in some other bank). Among
+        // valid choices, best fit (least disruption to era spread + time balance) sorts first,
+        // worst fit last.
+        const options = state.editMode
+          ? flatSlots
+              .filter(s => (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p }))
+              .sort((x, y) => optionFitScore(result, bi, p, x) - optionFitScore(result, bi, p, y))
+          : [];
         const swapControl = state.editMode ? `
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
-              ${flatSlots.map(s => `<option value="${s.bi}-${s.p}" ${s.bi === bi && s.p === p ? 'selected' : ''}>${s.game.name} — Bank ${s.bi + 1}, Round ${s.p}</option>`).join('')}
+              ${options.map(s => `<option value="${s.bi}-${s.p}" ${s.bi === bi && s.p === p ? 'selected' : ''}>${s.game.name} — ${fmtSec(s.game.avgSec)} (${timeBucket(s.game.avgSec, timeTh)}) — Bank ${s.bi + 1}, Round ${s.p}</option>`).join('')}
             </select>` : '';
         slots.push(`
           <div class="slot">
@@ -1499,7 +1637,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       }
       card.innerHTML = `
         <div class="head">
-          <span class="label">Bank ${bi + 1}</span>
+          <span class="labelWrap"><span class="label">Bank ${bi + 1}</span><button class="ghost small no-print bankRefreshBtn" data-bi="${bi}" type="button" title="Refresh this bank — swap in a different mix of games">↻</button></span>
           <span class="total">total ${fmtSec(b.total)}</span>
         </div>
         <div class="bankGrid">${slots.join('')}</div>
@@ -1521,6 +1659,10 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         });
       });
     }
+
+    list.querySelectorAll('.bankRefreshBtn').forEach(btn => {
+      btn.addEventListener('click', () => refreshBank(parseInt(btn.dataset.bi, 10)));
+    });
 
     const repeatSection = $('repeatSection');
     if (repeats.length === 0) {
@@ -1690,52 +1832,80 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return __measureCtx.measureText(text).width * 72 / 96;
   }
 
-  // Binary-search the largest font size that still lets the whole bank grid fit on one
-  // Letter page, accounting for estimated text wrapping inside each cell.
-  function fitDocxFontSize(banksData, cols, contentWidthPt, cellPadPt, tableBudgetPt) {
+  // Binary-search the largest font size that still lets the whole bank grid fit on one page —
+  // with the hard rule that every "BANK N" header and every game name stays on a single line
+  // (no wrapping). A font size only "fits" if every name at that size is narrower than its
+  // cell, so the search naturally settles on the largest size that keeps all text on one line.
+  // Uncapped-ish on purpose (hi=54) — with few banks and lots of spare page, this lets the text
+  // actually grow to fill the page rather than stopping at some modest "big enough" size.
+  function fitBankGridFontSize(banksData, cols, contentWidthPt, cellPadPt, tableBudgetPt) {
     const cellContentWidthPt = (contentWidthPt / cols) - cellPadPt * 2;
-    function linesForCell(b, fontSizePt) {
-      let lines = Math.max(1, Math.ceil(textWidthPt(`BANK ${b.index}`, fontSizePt, true) * 1.1 / cellContentWidthPt));
-      b.names.forEach(n => {
-        lines += Math.max(1, Math.ceil(textWidthPt(n, fontSizePt, false) * 1.1 / cellContentWidthPt));
-      });
-      return lines;
+    function cellFitsOneLine(b, fontSizePt) {
+      if (textWidthPt(`BANK ${b.index}`, fontSizePt, true) * 1.1 > cellContentWidthPt) return false;
+      return b.names.every(n => textWidthPt(n, fontSizePt, false) * 1.1 <= cellContentWidthPt);
+    }
+    function cellHeightPt(b, fontSizePt) {
+      const lineHeightPt = fontSizePt * 1.2;
+      return (1 + b.names.length) * lineHeightPt + cellPadPt * 2; // 1 header line + 1 line per name
     }
     function fits(fontSizePt) {
-      const lineHeightPt = fontSizePt * 1.2;
+      if (!banksData.every(b => cellFitsOneLine(b, fontSizePt))) return false;
       let total = 0;
       for (let i = 0; i < banksData.length; i += cols) {
         const rowBanks = banksData.slice(i, i + cols);
-        const maxLines = Math.max(...rowBanks.map(b => linesForCell(b, fontSizePt)));
-        total += maxLines * lineHeightPt + cellPadPt * 2;
+        total += Math.max(...rowBanks.map(b => cellHeightPt(b, fontSizePt)));
         if (total > tableBudgetPt) return false;
       }
       return true;
     }
-    let lo = 6, hi = 22;
-    if (!fits(lo)) return lo; // even the floor doesn't fit — use it anyway, best effort
-    for (let i = 0; i < 18; i++) {
+    let lo = 6, hi = 54;
+    if (!fits(lo)) return lo; // even the floor doesn't fit one line — use it anyway, best effort
+    for (let i = 0; i < 20; i++) {
       const mid = (lo + hi) / 2;
       if (fits(mid)) lo = mid; else hi = mid;
     }
     return Math.floor(lo * 2) / 2; // round to nearest 0.5pt
   }
 
+  // A long game name can only get so big before it needs a wider cell to stay on one line — and
+  // a wider cell means fewer columns. So instead of a fixed 3-column grid, try a spread of
+  // column counts and keep whichever gives the largest one-line-safe font (ties go to more
+  // columns, since that's the denser, more traditional-looking grid). This is what lets the
+  // grid actually fill the page for a typical run while still backing off to fewer, wider
+  // columns on the rare bank with an unusually long name.
+  function pickBankGridLayout(banksData, contentWidthPt, cellPadPt, tableBudgetPt) {
+    const maxCols = Math.max(1, Math.min(6, banksData.length));
+    let best = null;
+    for (let cols = 1; cols <= maxCols; cols++) {
+      const fontSizePt = fitBankGridFontSize(banksData, cols, contentWidthPt, cellPadPt, tableBudgetPt);
+      if (!best || fontSizePt > best.fontSizePt || (fontSizePt === best.fontSizePt && cols > best.cols)) {
+        best = { cols, fontSizePt };
+      }
+    }
+    return best;
+  }
+
+  // Shared page layout for both exports — landscape Letter, so both look the same and both get
+  // the same "fill the page" treatment.
+  function exportPageLayout() {
+    const pageWidthPt = 792, pageHeightPt = 612, marginPt = 40; // landscape Letter, ~0.55in margins
+    const titleBlockPt = 46; // reserved space for the title + subtitle lines above the table
+    return {
+      pageWidthPt, pageHeightPt, marginPt, titleBlockPt,
+      contentWidthPt: pageWidthPt - marginPt * 2,
+      tableBudgetPt: pageHeightPt - marginPt * 2 - titleBlockPt,
+    };
+  }
+
   async function buildDocxBlob() {
     const { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, WidthType, BorderStyle } = window.docx;
     const banksData = getBankGridData();
-    const cols = 3;
     const borderSpec = { style: BorderStyle.SINGLE, size: 4, color: '999999' };
 
-    // Explicit Letter page + 0.6in margins (rather than trusting library defaults), so the
-    // one-page fit calculation below has a known, stable budget to work against.
-    const pageWidthPt = 612, pageHeightPt = 792, marginPt = 43; // 0.6in margins
-    const contentWidthPt = pageWidthPt - marginPt * 2;
-    const titleBlockPt = 46; // reserved space for the title + subtitle lines above the table
-    const tableBudgetPt = pageHeightPt - marginPt * 2 - titleBlockPt;
+    const { pageWidthPt, pageHeightPt, marginPt, contentWidthPt, tableBudgetPt } = exportPageLayout();
     const cellPadPt = 5;
 
-    const fontSizePt = fitDocxFontSize(banksData, cols, contentWidthPt, cellPadPt, tableBudgetPt);
+    const { cols, fontSizePt } = pickBankGridLayout(banksData, contentWidthPt, cellPadPt, tableBudgetPt);
     const fontHalfPts = Math.round(fontSizePt * 2);
     const cellMarginTwips = Math.round(cellPadPt * 20);
 
@@ -1781,33 +1951,36 @@ Dracula\t23:47\t23:47\t23:47\t1`;
 
   function buildPdfBlob() {
     const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ unit: 'pt', format: 'letter' });
-    const pageW = doc.internal.pageSize.getWidth();
-    const pageH = doc.internal.pageSize.getHeight();
-    const margin = 36, cols = 3, gap = 10;
-    const cellW = (pageW - margin * 2 - gap * (cols - 1)) / cols;
+    const { pageWidthPt, pageHeightPt, marginPt, titleBlockPt, contentWidthPt, tableBudgetPt } = exportPageLayout();
+    const doc = new jsPDF({ unit: 'pt', format: 'letter', orientation: 'landscape' });
+    const cellPadPt = 5;
     const banksData = getBankGridData();
 
-    doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
-    doc.text('Tournament Banks', margin, margin + 10);
-    doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
-    doc.text(`${banksData.length} banks - ${state.bankSize} games each`, margin, margin + 28);
+    // Same column/font-fit search as the Word export (landscape page, same budget), so both
+    // exports look consistent and both keep every bank/game name on a single line — no wrapping.
+    const { cols, fontSizePt } = pickBankGridLayout(banksData, contentWidthPt, cellPadPt, tableBudgetPt);
+    const lineHeightPt = fontSizePt * 1.2;
+    const cellW = contentWidthPt / cols;
 
-    let y = margin + 50, x = margin, colIdx = 0, rowMaxH = 0;
-    const lineH = 14, headerH = 18;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
+    doc.text('Tournament Banks', marginPt, marginPt + 14);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+    doc.text(`${banksData.length} banks - ${state.bankSize} games each`, marginPt, marginPt + 30);
+
+    let y = marginPt + titleBlockPt, x = marginPt, colIdx = 0, rowMaxH = 0;
+    doc.setDrawColor(150);
     banksData.forEach(b => {
-      const cellH = headerH + b.names.length * lineH + 12;
-      if (y + cellH > pageH - margin) { doc.addPage(); y = margin; }
-      doc.setDrawColor(150);
+      const cellH = (1 + b.names.length) * lineHeightPt + cellPadPt * 2;
       doc.rect(x, y, cellW, cellH);
-      doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
-      doc.text(`BANK ${b.index}`, x + 8, y + 16);
-      doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
-      b.names.forEach((n, pi) => doc.text(String(n), x + 8, y + headerH + (pi + 1) * lineH));
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(fontSizePt);
+      const baselineOffset = cellPadPt + fontSizePt * 0.9;
+      doc.text(`BANK ${b.index}`, x + cellPadPt, y + baselineOffset);
+      doc.setFont('helvetica', 'normal');
+      b.names.forEach((n, pi) => doc.text(String(n), x + cellPadPt, y + baselineOffset + (pi + 1) * lineHeightPt));
       rowMaxH = Math.max(rowMaxH, cellH);
       colIdx++;
-      if (colIdx >= cols) { colIdx = 0; x = margin; y += rowMaxH + gap; rowMaxH = 0; }
-      else { x += cellW + gap; }
+      if (colIdx >= cols) { colIdx = 0; x = marginPt; y += rowMaxH; rowMaxH = 0; }
+      else { x += cellW; }
     });
     return doc.output('blob');
   }
@@ -1862,7 +2035,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (!confirm('Start a new tournament? This clears the pasted data and review choices (your saved era tags stay).')) return;
     state.rows = []; state.manualGames = []; state.dupGroups = []; state.mergeChoice = {}; state.workingGames = [];
     state.includeChoice = {}; state.timeOverride = {}; state.forceInclude = {}; state.included = []; state.classified = []; state.allClassified = []; state.result = null;
-    state.originalSnapshot = null; state.edited = false; state.editMode = false;
+    state.originalSnapshot = null; state.edited = false; state.editMode = false; state.seed = undefined;
     $('dataInput').value = '';
     safeSet(LS_DRAFT, '');
     $('card2').hidden = true; $('card3').hidden = true; $('resultsCard').hidden = true; $('notesFooter').hidden = true;
