@@ -282,7 +282,7 @@ footer.notes li{margin-bottom:4px;}
         <p><strong>1 · Qualifying data (optional):</strong> paste your matchplay.events export, or skip straight to step 2.</p>
         <p><strong>2 · Review:</strong> every game is included by default. Fix any era matches that need it, edit a time estimate by clicking it, or uncheck Active to hold a game out entirely. Add games by hand here too.</p>
         <p><strong>3 · Bank settings:</strong> choose how many banks and the target games per bank, and how ties should be broken if there are more games than slots (see "Too many games" below). Everything recalculates live.</p>
-        <p><strong>4 · Banks:</strong> review the generated banks, then copy as text or use "Export" to download a Word or PDF report — Print produces that same page-filling grid layout too, so what you print matches what you'd download. Don't like the result? "Try another arrangement" reruns the balancer from scratch for a different valid layout; the ↻ next to a bank's name keeps every other bank as-is and tries a fresh, balance-aware mix for just that one — it still favors good era/time fits like the balancer does, so it's "try again" for that bank rather than a purely random shuffle. Use "Edit banks" for hands-on control — its dropdown lists every game, sorted best fit to worst for that slot; an option that would create a duplicate or a same-round clash elsewhere is still selectable but flagged "conflicts" so you know before choosing it.</p>
+        <p><strong>4 · Banks:</strong> review the generated banks, then copy as text or use "Export" to download a Word or PDF report — Print produces that same page-filling grid layout too, so what you print matches what you'd download. Don't like the result? "Try another arrangement" takes the ideal, best-balanced layout and nudges a handful of games into different banks for a genuinely different mix — deliberately a little less tidy than ideal, not another attempt at "best". "Revert to ideal arrangement" shows up whenever the current layout has drifted from that best-balanced one — from a shuffle, a per-bank refresh, or a manual edit — and jumps straight back to it. The ↻ next to a bank's name keeps every other bank as-is and tries a fresh, balance-aware mix for just that one. Use "Edit banks" for hands-on control — its dropdown lists every game, sorted best fit to worst for that slot; an option that would create a duplicate or a same-round clash elsewhere is still selectable but flagged "conflicts" so you know before choosing it.</p>
       </section>
       <section>
         <h3>How balancing works</h3>
@@ -448,7 +448,8 @@ Medieval Madness	35:56	18:00	1:01:49	16
     </div>
 
     <div class="actions no-print">
-      <button class="ghost" id="shuffleBtn" type="button" title="Rerun the balancer for a different valid arrangement">↻ Try another arrangement</button>
+      <button class="ghost" id="shuffleBtn" type="button" title="Nudge a few games to different banks for a genuinely different mix">↻ Try another arrangement</button>
+      <button class="ghost" id="revertIdealBtn" type="button" hidden title="Go back to the best-balanced arrangement, undoing any shuffle, refresh, or manual edit">↺ Revert to ideal arrangement</button>
       <button class="ghost" id="editBanksBtn" type="button">Edit banks</button>
       <button class="ghost" id="resetEditsBtn" type="button" hidden>Reset to auto-generated</button>
       <div class="exportWrap">
@@ -1112,12 +1113,14 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     classified: [],
     allClassified: [],      // every game (active+inactive) for the Game list table / time-bucket calc
     result: null,           // live, editable arrangement
-    originalSnapshot: null, // untouched auto-generated arrangement, for "reset"
+    originalSnapshot: null, // baseline to "Reset to auto-generated" back to (last generate/shuffle)
+    idealSnapshot: null,    // the deterministic, best-balanced arrangement for the current settings —
+                             // "Try another arrangement" is a perturbation of this; "Revert to ideal
+                             // arrangement" jumps straight back to it.
     edited: false,
     editMode: false,
     numBanks: null,
     bankSize: null,
-    seed: undefined,        // undefined = deterministic; set by "Try another arrangement" for a different valid mix
   };
 
   const overrides = safeGet(LS_OVERRIDES) || {}; // normKey -> era string or year number
@@ -1504,35 +1507,50 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // Builds (or rebuilds) the arrangement from current settings + state.classified +
   // state.forceInclude. Used both by the Generate button and by "Include instead" in the
   // Held-out table, so forcing a game in re-runs the exact same pipeline in place.
-  function runGenerate() {
+  // genOpts.perturb: true when called from "Try another arrangement" — after computing the
+  // deterministic ideal arrangement (always done, every call, so state.idealSnapshot is always
+  // current for these settings/games), nudge it away from that ideal so the result actually
+  // looks different rather than risking the balancer's own optimize pass converging right back
+  // to the same grouping it would've picked anyway.
+  function runGenerate(genOpts = {}) {
     const numBanks = parseInt($('numBanks').value, 10);
     const bankSize = parseInt($('bankSize').value, 10);
     if (!numBanks || !bankSize) return false;
     const eraBalance = getEraBalanceMode();
     safeSet(LS_SETTINGS, { numBanks, bankSize, eraBalance });
-    let result;
+    let idealResult;
     try {
       const forced = Object.keys(state.forceInclude).filter(n => state.forceInclude[n]);
-      result = buildBanks(state.classified, numBanks, bankSize, { forceInclude: forced, eraBalance, seed: state.seed });
+      idealResult = buildBanks(state.classified, numBanks, bankSize, { forceInclude: forced, eraBalance });
     } catch (err) {
       $('settingsWarning').hidden = false;
       $('settingsWarning').classList.add('warn'); $('settingsWarning').classList.remove('good');
       $('settingsWarning').innerHTML = `<span class="icon">!</span><span>Couldn't build banks: ${err.message}. Try fewer banks, a smaller target size, or add more games.</span>`;
       return false;
     }
-    if (result.forceIncludeFailed && result.forceIncludeFailed.length) {
-      result.forceIncludeFailed.forEach(name => { delete state.forceInclude[name]; });
-      alert(`Couldn't force in: ${result.forceIncludeFailed.join(', ')} — every other included game is already forced in, so there's nothing left to hold out instead. Undo another override first, or uncheck Active on a game above to free up a slot.`);
+    if (idealResult.forceIncludeFailed && idealResult.forceIncludeFailed.length) {
+      idealResult.forceIncludeFailed.forEach(name => { delete state.forceInclude[name]; });
+      alert(`Couldn't force in: ${idealResult.forceIncludeFailed.join(', ')} — every other included game is already forced in, so there's nothing left to hold out instead. Undo another override first, or uncheck Active on a game above to free up a slot.`);
     }
     // Order banks longest total time first, fastest last — everything downstream (labels,
     // the repeat/swap tables, exports) reads bank number from array position, so sorting here
     // and refreshing the derived indices (dupFirstBank etc.) keeps it all consistent.
-    result.banks.sort((a, b) => b.total - a.total);
-    result.bankSizes = result.banks.map(b => b.size);
-    recomputeDerived(result);
+    idealResult.banks.sort((a, b) => b.total - a.total);
+    idealResult.bankSizes = idealResult.banks.map(b => b.size);
+    recomputeDerived(idealResult);
     state.numBanks = numBanks;
     state.bankSize = bankSize;
     state.eraBalance = eraBalance;
+    state.idealSnapshot = snapshotResult(idealResult);
+
+    let result = idealResult;
+    if (genOpts.perturb) {
+      result = cloneSnapshot(state.idealSnapshot);
+      recomputeDerived(result);
+      perturbArrangement(result);
+      recomputeDerived(result);
+    }
+
     state.originalSnapshot = snapshotResult(result);
     state.result = cloneSnapshot(state.originalSnapshot);
     recomputeDerived(state.result); // populates _dupSecondBank etc. consistently for both fresh and edited state
@@ -1553,12 +1571,25 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     $('resultsCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
 
-  // Don't like this arrangement? Rerun the balancer with a new random seed — still balanced
-  // (time, era spread, everything else) but breaks ties differently, so it's a genuinely
-  // different valid arrangement rather than a random mess. Same settings, same games.
+  // Don't like this arrangement? Take the ideal, best-balanced layout and nudge it — see
+  // perturbArrangement() — so it's a genuinely different, still-valid mix rather than a rebuild
+  // that often reconverges to the same grouping the balancer would pick anyway. "Revert to ideal
+  // arrangement" (wired below, near renderResults) undoes this back to the ideal in one click.
   $('shuffleBtn').addEventListener('click', () => {
-    state.seed = Math.floor(Math.random() * 2 ** 31);
-    runGenerate();
+    runGenerate({ perturb: true });
+  });
+
+  $('revertIdealBtn').addEventListener('click', () => {
+    if (!state.idealSnapshot) return;
+    state.result = cloneSnapshot(state.idealSnapshot);
+    recomputeDerived(state.result);
+    state.originalSnapshot = snapshotResult(state.result);
+    state.edited = false;
+    state.editMode = false;
+    $('editBanksBtn').textContent = 'Edit banks';
+    $('editHint').hidden = true;
+    $('resetEditsBtn').hidden = true;
+    renderResults();
   });
 
   // ---------- editable arrangement helpers ----------
@@ -1659,6 +1690,61 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return true;
   }
 
+  // Same arrangement, position for position? Compares by game name at each (bank, round) slot —
+  // used to decide whether the current result is still the ideal one (and so whether "Revert to
+  // ideal arrangement" needs to be offered at all).
+  function arrangementsEqual(a, b) {
+    if (!a || !b || a.banks.length !== b.banks.length) return false;
+    for (let i = 0; i < a.banks.length; i++) {
+      const ba = a.banks[i], bb = b.banks[i];
+      if (ba.size !== bb.size) return false;
+      for (let p = 1; p <= ba.size; p++) {
+        if (ba.pos[p].name !== bb.pos[p].name) return false;
+      }
+    }
+    return true;
+  }
+
+  // "Try another arrangement" starts from the ideal, best-balanced layout and nudges it — one
+  // random valid swap per bank, where a safe one exists — so the result is genuinely different
+  // to look at instead of risking the balancer's own swap-optimize pass reconverging to the same
+  // grouping it would've built anyway. Deliberately NOT weighted toward the best-scoring
+  // candidate the way the per-bank refresh is — that would just rebuild something close to
+  // ideal again — this is meant to be visibly different, not another attempt at "best".
+  function perturbArrangement(result) {
+    const numBanks = result.banks.length;
+    if (numBanks < 2) return false;
+    const bankOrder = Array.from({ length: numBanks }, (_, i) => i);
+    for (let i = bankOrder.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bankOrder[i], bankOrder[j]] = [bankOrder[j], bankOrder[i]];
+    }
+    let changedAny = false;
+    for (const bankIndex of bankOrder) {
+      const size = result.banks[bankIndex].size;
+      const positions = Array.from({ length: size }, (_, i) => i + 1);
+      for (let i = positions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [positions[i], positions[j]] = [positions[j], positions[i]];
+      }
+      for (const p of positions) {
+        const candidates = [];
+        result.banks.forEach((b, bi) => {
+          if (bi === bankIndex) return;
+          for (let tp = 1; tp <= b.size; tp++) {
+            if (isValidSwapTarget(result, { bi: bankIndex, p }, { bi, p: tp })) candidates.push({ bi, p: tp });
+          }
+        });
+        if (candidates.length === 0) continue;
+        const pick = candidates[Math.floor(Math.random() * candidates.length)]; // plain random — not weighted toward "best"
+        swapSlots(result, { bi: bankIndex, p }, pick);
+        changedAny = true;
+        break; // one swap is enough to make this bank visibly different; move on to the next
+      }
+    }
+    return changedAny;
+  }
+
   // How good a fit is candidate slot s if swapped into slot (bi, p)? Lower = better fit.
   // Mirrors the same "totals variance + era penalty" scoring the balancer itself uses when
   // deciding whether a swap is worth making (see the swap-optimize pass in logic.js), so the
@@ -1751,6 +1837,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   function renderResults() {
     const result = state.result;
     const { banks, repeats, roundCollisions } = result;
+    $('revertIdealBtn').hidden = !state.idealSnapshot || arrangementsEqual(result, state.idealSnapshot);
     const totals = banks.map(b => b.total);
     const avg = totals.reduce((a, b) => a + b, 0) / totals.length;
     const sizes = banks.map(b => b.size);
@@ -2253,7 +2340,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (!confirm('Start a new tournament? This clears the pasted data and review choices (your saved era tags stay).')) return;
     state.rows = []; state.manualGames = []; state.dupGroups = []; state.mergeChoice = {}; state.workingGames = [];
     state.includeChoice = {}; state.timeOverride = {}; state.forceInclude = {}; state.included = []; state.classified = []; state.allClassified = []; state.result = null;
-    state.originalSnapshot = null; state.edited = false; state.editMode = false; state.seed = undefined;
+    state.originalSnapshot = null; state.idealSnapshot = null; state.edited = false; state.editMode = false;
     $('dataInput').value = '';
     safeSet(LS_DRAFT, '');
     $('card2').hidden = true; $('card3').hidden = true; $('resultsCard').hidden = true; $('notesFooter').hidden = true;
