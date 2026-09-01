@@ -185,6 +185,7 @@ tr:last-child td{border-bottom:none;}
 .chip.modern{background:color-mix(in srgb, var(--era-modern) 18%, transparent); color:var(--era-modern);}
 .chip.custom, .chip.unknown{background:color-mix(in srgb, var(--era-custom) 18%, transparent); color:var(--era-custom);}
 .chip.repeat{background:color-mix(in srgb, var(--accent) 20%, transparent); color:var(--accent);}
+.chip.repeat.collision{background:color-mix(in srgb, var(--warn) 24%, transparent); color:var(--warn); font-weight:700;}
 .chip.manual{background:color-mix(in srgb, var(--accent2) 20%, transparent); color:var(--accent2);}
 .chip.fast{background:color-mix(in srgb, var(--time-fast) 18%, transparent); color:var(--time-fast);}
 .chip.medium{background:color-mix(in srgb, var(--time-medium) 20%, transparent); color:var(--time-medium);}
@@ -437,15 +438,16 @@ Medieval Madness	35:56	18:00	1:01:49	16
 
     <div id="bankList"></div>
 
-    <div id="repeatSection" style="margin-top:22px;" hidden>
-      <h3 style="font-family:'Kanit',sans-serif;font-size:14px;margin-bottom:8px;">Repeated games — round spacing</h3>
+    <details id="repeatSection" style="margin-top:22px;" hidden>
+      <summary style="cursor:pointer; font-family:'Kanit',sans-serif; font-size:14px; margin-bottom:8px;">Repeated games — round spacing</summary>
+      <p class="hint" style="margin:6px 0 10px;">A game played in more than one bank is tagged <span class="chip repeat" style="margin:0 2px;">shared</span> on its slot. If two banks truly can't avoid landing on the same round for it, that occurrence turns <span class="chip repeat collision" style="margin:0 2px;">shared</span> — red — so it stands out before match play starts.</p>
       <div class="tablewrap">
         <table>
           <thead><tr><th>Game</th><th>Scheduled in</th><th class="num">Avg time</th></tr></thead>
           <tbody id="repeatTableBody"></tbody>
         </table>
       </div>
-    </div>
+    </details>
 
     <div class="actions no-print">
       <button class="ghost" id="shuffleBtn" type="button" title="Nudge a few games to different banks for a genuinely different mix">↻ Try another arrangement</button>
@@ -933,13 +935,16 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   // for any other game: it's the same physical machine, so the different groups that need it
   // shouldn't want it at the same real-world moment. Round NUMBER alone doesn't capture that —
   // "round 1" in a bank with short games happens much sooner, in wall-clock terms, than "round
-  // 1" in a bank full of long ones. So each candidate round is scored by roughly where it falls
-  // in THAT bank's own timeline (its round number as a fraction of that bank's total rounds,
-  // which stands in for a fraction of that bank's total playtime), and — for a game repeated
-  // more than twice — rounds are chosen bank by bank, each one picking whichever free round is
-  // farthest (in that timeline sense) from the rounds already picked for the same game
-  // elsewhere. Games hosted by the most banks are placed first, since they have the least
-  // slack to work with once other repeats start claiming rounds.
+  // 1" in a bank full of long ones — so each candidate round is scored by an actual ESTIMATED
+  // TIME: that bank's own average game length times how far into the bank the round sits. For a
+  // game repeated more than twice, rounds are chosen bank by bank, each one picking whichever
+  // free round's estimated time is farthest from the times already picked for the same game
+  // elsewhere — spreading occurrences apart in real expected timing, not just round position.
+  // Games hosted by the most banks are placed first, since they have the least slack to work
+  // with once other repeats start claiming rounds. Round 1 is deliberately kept off the table
+  // whenever a bank still has another free round to offer instead: two groups both opening
+  // their very first game on the same shared machine is the one case worth actively avoiding,
+  // not just leaving to whichever round the gap-maximizing pick happens to land on.
   const repeatHostBanks = {}; // name -> [bankIndex, ...] (only for repeated games)
   for (let bi = 0; bi < numBanks; bi++) {
     banks[bi].games.forEach(g => {
@@ -947,13 +952,14 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
     });
   }
   const claimedRounds = Array.from({ length: numBanks }, () => new Set());
-  function timeFraction(bi, round) { return (round - 0.5) / banks[bi].size; }
+  function bankAvgSec(bi) { return banks[bi].size ? banks[bi].total / banks[bi].size : 0; }
+  function timeEstimate(bi, round) { return bankAvgSec(bi) * (round - 0.5); }
   const repeatRoundByNameAndBank = {}; // name -> { bankIndex: round }
   Object.keys(repeatHostBanks)
     .sort((a, b) => repeatHostBanks[b].length - repeatHostBanks[a].length)
     .forEach(name => {
       const hostBanks = repeatHostBanks[name];
-      const chosenFractions = [];
+      const chosenTimes = [];
       const rounds = {};
       const order = [...hostBanks].sort((a, b) => {
         const freeA = banks[a].size - claimedRounds[a].size, freeB = banks[b].size - claimedRounds[b].size;
@@ -961,17 +967,27 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
       });
       for (const bi of order) {
         const size = banks[bi].size;
-        let bestRound = null, bestGap = -Infinity;
-        for (let p = 1; p <= size; p++) {
-          if (claimedRounds[bi].has(p)) continue;
-          const frac = timeFraction(bi, p);
-          const gap = chosenFractions.length === 0 ? 1 : Math.min(...chosenFractions.map(f => Math.abs(f - frac)));
-          if (gap > bestGap) { bestGap = gap; bestRound = p; }
+        const freeRounds = [];
+        for (let p = 1; p <= size; p++) if (!claimedRounds[bi].has(p)) freeRounds.push(p);
+        // Maximize this occurrence's time-gap from wherever the same game already landed
+        // elsewhere — this is what keeps two occurrences of the SAME game off round 1 together
+        // in the normal case (one already claiming a round near the start makes round 1 the
+        // worst, not best, gap for the next one). Round 1 gets a small tie-break penalty on top,
+        // but only a soft one: excluding it outright (rather than deprioritizing it) backfires in
+        // heavily-saturated pools, where nearly every slot is some repeated game — an outright ban
+        // just forces whichever game gets placed last in a bank onto round 1 instead, concentrating
+        // collisions there rather than actually reducing them.
+        let bestRound = null, bestScore = -Infinity;
+        for (const p of freeRounds) {
+          const t = timeEstimate(bi, p);
+          const gap = chosenTimes.length === 0 ? Infinity : Math.min(...chosenTimes.map(ct => Math.abs(ct - t)));
+          const score = gap === Infinity ? Infinity : gap - (p === 1 ? bankAvgSec(bi) : 0);
+          if (score > bestScore) { bestScore = score; bestRound = p; }
         }
-        if (bestRound === null) bestRound = 1; // shouldn't happen — every bank has room for its own repeats
+        if (bestRound === null) bestRound = freeRounds[0] !== undefined ? freeRounds[0] : 1; // shouldn't happen — every bank has room for its own repeats
         rounds[bi] = bestRound;
         claimedRounds[bi].add(bestRound);
-        chosenFractions.push(timeFraction(bi, bestRound));
+        chosenTimes.push(timeEstimate(bi, bestRound));
       }
       repeatRoundByNameAndBank[name] = rounds;
     });
@@ -1010,7 +1026,10 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   // what's left by swapping a colliding occurrence with another round in the SAME bank (never
   // moving it to a different bank, which would undo the placement work above), but only when
   // the swap doesn't just relocate the collision somewhere else. This can't introduce a
-  // same-bank duplicate — it's just reordering which round already-held games sit in.
+  // same-bank duplicate — it's just reordering which round already-held games sit in. Object
+  // keys that look like array indices (round numbers) always iterate in ascending numeric order
+  // in JS regardless of insertion order, so round-1 collisions are naturally handled first in
+  // every pass, before other rounds' fixes can claim the alternate rounds they'd need.
   let collisions = computeRoundCollisions();
   let repairGuard = 0;
   while (Object.keys(collisions).length && repairGuard < 50) {
@@ -1024,16 +1043,31 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
         for (let k = 1; k < hostBanksAtRound.length; k++) { // leave the first occurrence in place
           const bi = hostBanksAtRound[k];
           const b = banks[bi];
+          // Where else (which estimated times) this same game already lands, so the swap target
+          // can be scored by how well it spreads this occurrence away from those — same idea as
+          // the initial placement above.
+          const otherTimes = [];
+          banks.forEach((b2, i2) => {
+            if (i2 === bi) return;
+            for (let pp = 1; pp <= b2.size; pp++) if (b2.pos[pp].name === name) otherTimes.push(timeEstimate(i2, pp));
+          });
+          let bestAlt = null, bestScore = -Infinity;
           for (let altRound = 1; altRound <= b.size; altRound++) {
             if (altRound === round) continue;
             const other = b.pos[altRound];
             const otherOkAtRound = !banks.some((b2, i2) => i2 !== bi && b2.size >= round && b2.pos[round].name === other.name);
             const nameOkAtAltRound = !banks.some((b2, i2) => i2 !== bi && b2.size >= altRound && b2.pos[altRound].name === name);
-            if (otherOkAtRound && nameOkAtAltRound) {
-              const tmp = b.pos[round]; b.pos[round] = b.pos[altRound]; b.pos[altRound] = tmp;
-              fixedAny = true;
-              break;
-            }
+            if (!otherOkAtRound || !nameOkAtAltRound) continue;
+            const t = timeEstimate(bi, altRound);
+            const gap = otherTimes.length === 0 ? Infinity : Math.min(...otherTimes.map(ot => Math.abs(ot - t)));
+            // Never prefer moving something INTO round 1 over an equally-safe later round — round
+            // 1 only wins this comparison when it's the only safe option at all.
+            const score = gap - (altRound === 1 ? 1e9 : 0);
+            if (score > bestScore) { bestScore = score; bestAlt = altRound; }
+          }
+          if (bestAlt !== null) {
+            const tmp = b.pos[round]; b.pos[round] = b.pos[bestAlt]; b.pos[bestAlt] = tmp;
+            fixedAny = true;
           }
         }
       }
@@ -1479,12 +1513,12 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       warnEl.hidden = true;
     } else if (unique < target && target - unique > unique) {
       warnEl.hidden = false;
-      warnEl.classList.add('warn'); warnEl.classList.remove('good');
-      warnEl.innerHTML = `<span class="icon">!</span><span>${target} target slots is a lot more than the ${unique} games available — some games will need to repeat into more than two banks (never twice in the <em>same</em> bank), each occurrence scheduled as far apart in real time as the arrangement allows. If a bank ever truly can't avoid using a game at the same time as another bank, you'll see it flagged in the results. For a cleaner run, add more games or lower banks/target size.</span>`;
+      warnEl.classList.remove('warn'); warnEl.classList.add('good');
+      warnEl.innerHTML = `<span class="icon">i</span><span>${target} target slots is more than the ${unique} games available, so some games will repeat into more than two banks (never twice in the <em>same</em> bank) — that's fine, each occurrence is scheduled as far apart in estimated real time as the arrangement allows. Shared games are tagged "shared" in the results; if a bank truly can't avoid landing on the same round as another bank for one, that occurrence is tagged "shared" in red so it stands out.</span>`;
     } else if (unique < target) {
       warnEl.hidden = false;
       warnEl.classList.remove('warn'); warnEl.classList.add('good');
-      warnEl.innerHTML = `<span class="icon">i</span><span>${target - unique} game${target - unique === 1 ? '' : 's'} will repeat across two banks (shortest-average games chosen automatically), spaced by round for machine sharing. Every bank stays at ${bankSize} games.</span>`;
+      warnEl.innerHTML = `<span class="icon">i</span><span>${target - unique} game${target - unique === 1 ? '' : 's'} will repeat across two banks (shortest-average games chosen automatically), spaced apart in estimated time for machine sharing — tagged "shared" in the results. Every bank stays at ${bankSize} games.</span>`;
     } else if (unique > target) {
       const extra = unique - target;
       warnEl.hidden = false;
@@ -1547,6 +1581,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (genOpts.perturb) {
       result = cloneSnapshot(state.idealSnapshot);
       recomputeDerived(result);
+      perturbIncludedSet(result);
       perturbArrangement(result);
       recomputeDerived(result);
     }
@@ -1745,6 +1780,39 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     return changedAny;
   }
 
+  // "Try another arrangement" shouldn't always keep the exact same GAMES either. When there are
+  // more games than slots, buildBanks() picks a deterministic subset every time (each era gives
+  // up its own longest-average games first) — without this, a game that always wins that cut (or
+  // always loses it) would look "stuck" no matter how many times you shuffle. Swap a few held-out
+  // games back in for currently-included, non-repeated games before rearranging rounds/banks,
+  // preferring a same-era swap so the era balance the settings asked for doesn't drift.
+  function perturbIncludedSet(result) {
+    const dropped = result.droppedGames || [];
+    if (!dropped.length) return false;
+    const shuffled = [...dropped];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const swapCount = Math.max(1, Math.min(shuffled.length, Math.round(shuffled.length * 0.3)));
+    let swappedAny = false;
+    for (let i = 0; i < swapCount; i++) {
+      const incoming = shuffled[i];
+      const includedSlots = allSlotsFlat(result).filter(s => !result.repeats.includes(s.game.name));
+      if (!includedSlots.length) break;
+      const sameEra = includedSlots.filter(s => s.game.era === incoming.era);
+      const pool = sameEra.length ? sameEra : includedSlots;
+      const target = pool[Math.floor(Math.random() * pool.length)];
+      const outgoing = result.banks[target.bi].pos[target.p];
+      result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null };
+      result.banks[target.bi].total += incoming.avgSec - outgoing.avgSec;
+      result.droppedGames = result.droppedGames.filter(g => g.name !== incoming.name);
+      result.droppedGames.push(outgoing);
+      swappedAny = true;
+    }
+    return swappedAny;
+  }
+
   // How good a fit is candidate slot s if swapped into slot (bi, p)? Lower = better fit.
   // Mirrors the same "totals variance + era penalty" scoring the balancer itself uses when
   // deciding whether a swap is worth making (see the swap-optimize pass in logic.js), so the
@@ -1800,14 +1868,63 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     }
     return ranked[ranked.length - 1].c;
   }
-  // Core of "refresh" — every slot in this bank gets swapped with a balance-aware, valid pick
-  // from elsewhere (never leaving the game pool, since every game already lives in some bank;
-  // "refreshing" one bank necessarily means trading with the rest). Skips a slot only if no safe
-  // swap exists for it.
+  // How good a fit is it to drop `incoming` (a currently held-out game) into slot (bi, p) of this
+  // bank, in place of whatever's there? Same spirit as optionFitScore — minimize the disruption
+  // to this bank's total time and era spread — but scoped to a single bank, since a held-out game
+  // isn't "coming from" anywhere else that also needs to stay balanced.
+  function insertFitScore(result, bi, p, incoming) {
+    const bank = result.banks[bi];
+    const outgoing = bank.pos[p];
+    let score = (incoming.avgSec - outgoing.avgSec) ** 2;
+    const gamesAfter = [];
+    for (let pp = 1; pp <= bank.size; pp++) gamesAfter.push(pp === p ? incoming : bank.pos[pp]);
+    score += bankEraPenalty(gamesAfter);
+    return score;
+  }
+
+  // A game counts as "shared" only while it actually occupies 2+ slots across the current
+  // arrangement. Pulling a held-out game into a slot (see refreshBankSlots below) can drop a
+  // repeated game back down to a single occurrence, so the repeats list needs to stay in sync
+  // with what's actually on the board — recomputed from scratch is cheap and always correct.
+  function recomputeRepeats(result) {
+    const counts = {};
+    result.banks.forEach(b => { for (let p = 1; p <= b.size; p++) { const n = b.pos[p].name; counts[n] = (counts[n] || 0) + 1; } });
+    result.repeats = Object.keys(counts).filter(n => counts[n] > 1);
+  }
+
+  // Core of "refresh". Ideally, refreshing one bank shouldn't ripple into any other bank at all —
+  // so for each slot, first try pulling in a currently held-out game (one that isn't in ANY bank
+  // right now, so there's nothing else to disturb) before ever trading with another bank. Only
+  // once the held-out pool has nothing safe left to offer does a slot fall back to a cross-bank
+  // swap, exactly as before. Skips a slot only if neither option has anything safe for it.
   function refreshBankSlots(bankIndex) {
     const result = state.result;
-    const size = result.banks[bankIndex].size;
+    const bank = result.banks[bankIndex];
+    const size = bank.size;
+    const availableDropped = [...(result.droppedGames || [])];
     for (let p = 1; p <= size; p++) {
+      if (availableDropped.length) {
+        const safeDropped = availableDropped.filter(g => {
+          for (let pp = 1; pp <= bank.size; pp++) { if (pp !== p && bank.pos[pp].name === g.name) return false; }
+          return true;
+        });
+        if (safeDropped.length) {
+          const ranked = safeDropped
+            .map(g => ({ g, score: insertFitScore(result, bankIndex, p, g) }))
+            .sort((a, b) => a.score - b.score);
+          const weights = ranked.map((_, i) => 1 / (i + 1));
+          const totalWeight = weights.reduce((a, b) => a + b, 0);
+          let r = Math.random() * totalWeight, pick = ranked[ranked.length - 1].g;
+          for (let i = 0; i < ranked.length; i++) { r -= weights[i]; if (r <= 0) { pick = ranked[i].g; break; } }
+          const outgoing = bank.pos[p];
+          bank.pos[p] = { ...pick, dupInstance: null };
+          bank.total += pick.avgSec - outgoing.avgSec;
+          availableDropped.splice(availableDropped.indexOf(pick), 1);
+          result.droppedGames = result.droppedGames.filter(g => g !== pick);
+          result.droppedGames.push(outgoing);
+          continue; // this slot's done — no other bank was touched
+        }
+      }
       const candidates = [];
       result.banks.forEach((b, bi) => {
         if (bi === bankIndex) return;
@@ -1819,6 +1936,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       const pick = pickWeightedSwapCandidate(result, bankIndex, p, candidates);
       swapSlots(result, { bi: bankIndex, p }, pick);
     }
+    recomputeRepeats(result);
   }
   function markEditedAndRender() {
     recomputeDerived(state.result);
@@ -1864,6 +1982,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       for (let p = 1; p <= b.size; p++) {
         const g = b.pos[p];
         const isRepeat = repeats.includes(g.name);
+        const isCollision = isRepeat && roundCollisions && roundCollisions[p] && roundCollisions[p].includes(g.name);
         const slotId = `${bi}-${p}`;
         // Every game is offered — nothing is hidden. An option that would create a duplicate
         // within a bank or a new round collision (the same game already scheduled for this
@@ -1878,11 +1997,11 @@ Dracula\t23:47\t23:47\t23:47\t1`;
           : [];
         const swapControl = state.editMode ? `
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
-              ${options.map(s => `<option value="${s.bi}-${s.p}" ${s.bi === bi && s.p === p ? 'selected' : ''}${s.valid ? '' : ' style="color:#b45309;"'}>${s.game.name} — ${fmtSec(s.game.avgSec)} (${timeBucket(s.game.avgSec, timeTh)}) — Bank ${s.bi + 1}, Round ${s.p}${s.valid ? '' : ' — conflicts'}</option>`).join('')}
+              ${options.map(s => `<option value="${s.bi}-${s.p}" ${s.bi === bi && s.p === p ? 'selected' : ''}${s.valid ? '' : ' style="color:#b45309;"'}>${s.game.name} — ${fmtSec(s.game.avgSec)}${s.valid ? '' : ' — conflicts'}</option>`).join('')}
             </select>` : '';
         slots.push(`
           <div class="slot">
-            <div class="pos">Round ${p}${isRepeat ? ' <span class="chip repeat" style="margin-left:4px;">shared</span>' : ''}</div>
+            <div class="pos">Round ${p}${isRepeat ? ` <span class="chip repeat${isCollision ? ' collision' : ''}" style="margin-left:4px;"${isCollision ? ' title="Also scheduled in this same round in another bank — starts at the same time"' : ' title="This game is also scheduled in another bank"'}>shared</span>` : ''}</div>
             <div class="game">${g.name}</div>
             <div class="footer">
               <span class="chip ${g.era.toLowerCase()}">${g.era}</span>
