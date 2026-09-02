@@ -119,6 +119,7 @@ p{margin:0;}
 .mono, .num, table td.num, table th.num{font-family:'IBM Plex Mono', ui-monospace, monospace; font-variant-numeric:tabular-nums;}
 
 header.top{display:flex; align-items:baseline; justify-content:space-between; gap:16px; padding-bottom:20px; border-bottom:1px solid var(--border); margin-bottom:28px; flex-wrap:wrap;}
+header.top .headerActions{display:flex; align-items:center; gap:8px;}
 header.top .brand{display:flex; align-items:center; gap:10px;}
 header.top .brand .dot{width:12px;height:12px;border-radius:3px;background:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);}
 header.top .tagline{color:var(--ink-soft); font-size:13px; max-width:420px;}
@@ -286,7 +287,10 @@ footer.notes li{margin-bottom:4px;}
       </div>
     </div>
     <div class="tagline">Build balanced tournament banks from qualifying data, a hand-typed list, or both — mixed era, mixed time, machine-share collisions avoided.</div>
-    <button class="ghost small no-print" id="helpBtn" type="button">Help</button>
+    <div class="headerActions no-print">
+      <button class="ghost small no-print" id="clearAllDataBtn" type="button" title="Erase all saved data — pasted draft, era tags, and settings — and start completely fresh">Clear all saved data</button>
+      <button class="ghost small no-print" id="helpBtn" type="button">Help</button>
+    </div>
   </header>
 
   <dialog id="helpModal">
@@ -345,9 +349,9 @@ Medieval Madness	35:56	18:00	1:01:49	16
     <div class="field" style="max-width:260px; margin-bottom:16px;">
       <label for="roundToMinutes">Round game times to nearest</label>
       <select id="roundToMinutes" style="font-size:13px; padding:7px 8px;">
-        <option value="1">1 minute (no rounding)</option>
+        <option value="1" selected>1 minute (no rounding)</option>
         <option value="2">2 minutes</option>
-        <option value="5" selected>5 minutes</option>
+        <option value="5">5 minutes</option>
         <option value="10">10 minutes</option>
         <option value="15">15 minutes</option>
       </select>
@@ -1363,6 +1367,9 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   }
   function safeSet(key, val) {
     try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* ignore */ }
+  }
+  function safeRemove(key) {
+    try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
   }
 
   const state = {
@@ -3166,9 +3173,29 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     $('dataInput').value = '';
     safeSet(LS_DRAFT, '');
     $('card2').hidden = true; $('card3').hidden = true; $('resultsCard').hidden = true; $('notesFooter').hidden = true;
+    // droppedSection ("Held out this run") lives OUTSIDE resultsCard — its own top-level card, not
+    // a child of it — so hiding resultsCard above doesn't hide it, and renderDroppedSection() only
+    // runs again on the NEXT Generate. Left alone, the previous tournament's held-out table (and
+    // "Include instead" overrides list) stayed visible on screen through this reset. Hide and clear
+    // it explicitly here too.
+    $('droppedSection').hidden = true;
+    $('droppedTableBody').innerHTML = '';
     $('parseSummary').textContent = ''; $('manualAddMsg').textContent = '';
     setStepPill(1);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
+  // Separate from "Start a new tournament" above, which deliberately KEEPS saved era tags (they're
+  // meant to carry over between runs sharing overlapping games) and saved settings. This is the
+  // full wipe: every piece of data this browser remembers for the app, gone, back to a completely
+  // first-visit state. Lives in the header, not the results actions row, so it's reachable from any
+  // step — including before a tournament's ever been generated.
+  $('clearAllDataBtn').addEventListener('click', () => {
+    if (!confirm('Clear ALL saved data? This erases the pasted draft, every saved era-tag override, and your saved settings (bank count/size, era balance, rounding) — not just the current tournament. This cannot be undone.')) return;
+    safeRemove(LS_DRAFT);
+    safeRemove(LS_OVERRIDES);
+    safeRemove(LS_SETTINGS);
+    location.reload();
   });
 })();
 
