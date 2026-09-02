@@ -38,6 +38,8 @@
   --good-bg:#e4efe1;
   --warn:#a5432f;
   --warn-bg:#f5e3dd;
+  --share:#7c3aed;
+  --share-bg:#efe7fb;
   --era-em:#8d6fb0;
   --era-ss:#3f79a6;
   --era-dmd:#c17d2e;
@@ -63,6 +65,8 @@
     --good-bg:#1e2a1f;
     --warn:#e0836d;
     --warn-bg:#2c1e1a;
+    --share:#a78bfa;
+    --share-bg:#2a2140;
     --era-em:#b79bdb;
     --era-ss:#7db1dd;
     --era-dmd:#e0a458;
@@ -243,6 +247,7 @@ tr:last-child td{border-bottom:none;}
 .retireBtn.undoRetireBtn{border-color:var(--accent2); color:var(--accent2);}
 .retireBtn.undoRetireBtn:hover{background:color-mix(in srgb, var(--accent2) 15%, transparent);}
 .retiredNote{font-size:11px; font-weight:600; color:var(--warn); margin:-2px 0 6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
+.sharedNote{font-size:11px; font-weight:600; color:var(--share); margin:-2px 0 6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
 .linklike{background:none; border:none; padding:0; margin:0; color:var(--accent2); font-weight:600; font-size:11px; text-decoration:underline; cursor:pointer;}
 .linklike:hover{opacity:.8;}
 
@@ -1012,7 +1017,28 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             const iGamesAfter = banks[i].games.map((g, k) => (k === pi ? gj : g));
             const jGamesAfter = banks[j].games.map((g, k) => (k === pj ? gi : g));
             const newSpreadPenalty = bankSpreadPenalty(iGamesAfter, idealYearPerGame) + bankSpreadPenalty(jGamesAfter, idealYearPerGame);
-            if (newVar + newSpreadPenalty < oldVar + oldSpreadPenalty - 1) {
+            // Primary goal: keep the tournament's single longest bank as short as possible — that
+            // one bank is what everyone else's group ends up waiting on, so shrinking it outweighs
+            // ordinary variance tidying elsewhere. But era/year balance still gets a real vote here,
+            // not just a tiebreak once the max stops moving: a swap that shaves the bottleneck down
+            // only slightly while creating a real era clash can still lose. The two are compared in
+            // the same units this file already uses everywhere else — raw seconds vs. eraPairPenalty
+            // points (SAME_ERA_PENALTY 750, adjacent-era 600, ... — see eraPairPenalty above), simply
+            // added together, exactly like the variance+spread combination just below. A SAME-ERA
+            // swap (a faster EM for a slower EM, same for any other era) costs nothing here — every
+            // era pair it's part of scores identically before and after, since eraPairPenalty only
+            // looks at era, not which specific game — so those are effectively always taken whenever
+            // they shrink the bottleneck, exactly as they should be. maxOthers is recomputed from
+            // live bank totals each candidate (not cached), since earlier swaps this same pass may
+            // have already changed some of them.
+            let maxOthers = -Infinity;
+            for (let k = 0; k < numBanks; k++) { if (k !== i && k !== j) maxOthers = Math.max(maxOthers, banks[k].total); }
+            const oldGlobalMax = Math.max(maxOthers, oldI, oldJ);
+            const newGlobalMax = Math.max(maxOthers, newI, newJ);
+            const spreadDeltaIJ = newSpreadPenalty - oldSpreadPenalty;
+            const shrinksMaxWithEraVote = (newGlobalMax - oldGlobalMax) + spreadDeltaIJ < -1;
+            const tiesMaxAndImproves = newGlobalMax <= oldGlobalMax + 1e-9 && (newVar + newSpreadPenalty < oldVar + oldSpreadPenalty - 1);
+            if (shrinksMaxWithEraVote || tiesMaxAndImproves) {
               banks[i].games[pi] = gj;
               banks[j].games[pj] = gi;
               banks[i].total = newI; banks[j].total = newJ;
@@ -1135,6 +1161,26 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
   const claimedRounds = Array.from({ length: numBanks }, () => new Set());
   function bankAvgSec(bi) { return banks[bi].size ? banks[bi].total / banks[bi].size : 0; }
   function timeEstimate(bi, round) { return bankAvgSec(bi) * (round - 0.5); }
+  // Round-placement bias for a shared/repeated game: prefer a middle round of the bank over round
+  // 1 or the last round. A shared game is the one point in the schedule another bank's group might
+  // have to wait on; landing it in round 1 stalls the whole event before it's even underway,
+  // landing it in the last round holds up the close, but a middle round has slack on both sides.
+  // Returns a 0..1 fraction — 0 at every non-edge round, 1 at round 1, `lastRoundWeight` at the
+  // last round. Round 1 always gets the full weight (this is the same soft nudge this scoring
+  // already used, single-edge, before this bias was extended to the last round too — kept at full
+  // strength since it was already tuned and proven not to backfire). The last round gets a
+  // DELIBERATELY SMALLER weight rather than an equal one: a size-3 bank has exactly one true
+  // middle round (round 2), so treating round 1 and round 3 as equally bad funnels every
+  // repeated game toward that single round and quickly saturates it, which then forces the
+  // overflow right back onto the edges — worse than doing nothing. Leaving the last round only
+  // partially discouraged keeps it available as a release valve, so the "avoid the edges" bias
+  // never costs more collisions than it prevents (verified against several bank sizes and
+  // oversubscription levels — see diag_collision_middle_bias.js).
+  function edgePenaltyFraction(p, size) {
+    if (p === 1) return 1;
+    if (p === size) return 0.5;
+    return 0;
+  }
   const repeatRoundByNameAndBank = {}; // name -> { bankIndex: round }
   Object.keys(repeatHostBanks)
     .sort((a, b) => repeatHostBanks[b].length - repeatHostBanks[a].length)
@@ -1153,16 +1199,19 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
         // Maximize this occurrence's time-gap from wherever the same game already landed
         // elsewhere — this is what keeps two occurrences of the SAME game off round 1 together
         // in the normal case (one already claiming a round near the start makes round 1 the
-        // worst, not best, gap for the next one). Round 1 gets a small tie-break penalty on top,
-        // but only a soft one: excluding it outright (rather than deprioritizing it) backfires in
-        // heavily-saturated pools, where nearly every slot is some repeated game — an outright ban
-        // just forces whichever game gets placed last in a bank onto round 1 instead, concentrating
-        // collisions there rather than actually reducing them.
+        // worst, not best, gap for the next one). The start AND end round each get a small
+        // tie-break penalty on top (see edgePenaltyFraction) — a shared game is the one point another
+        // bank's group might have to wait on, so the middle of the bank is the least disruptive
+        // place for it — but only a soft one: excluding the edges outright (rather than
+        // deprioritizing them) backfires in heavily-saturated pools, where nearly every slot is
+        // some repeated game — an outright ban just forces whichever game gets placed last in a
+        // bank onto an edge round instead, concentrating collisions there rather than actually
+        // reducing them.
         let bestRound = null, bestScore = -Infinity;
         for (const p of freeRounds) {
           const t = timeEstimate(bi, p);
           const gap = chosenTimes.length === 0 ? Infinity : Math.min(...chosenTimes.map(ct => Math.abs(ct - t)));
-          const score = gap === Infinity ? Infinity : gap - (p === 1 ? bankAvgSec(bi) : 0);
+          const score = gap === Infinity ? Infinity : gap - edgePenaltyFraction(p, size) * bankAvgSec(bi);
           if (score > bestScore) { bestScore = score; bestRound = p; }
         }
         if (bestRound === null) bestRound = freeRounds[0] !== undefined ? freeRounds[0] : 1; // shouldn't happen — every bank has room for its own repeats
@@ -1241,9 +1290,10 @@ function buildBanks(games, numBanks, bankSize, opts = {}) {
             if (!otherOkAtRound || !nameOkAtAltRound) continue;
             const t = timeEstimate(bi, altRound);
             const gap = otherTimes.length === 0 ? Infinity : Math.min(...otherTimes.map(ot => Math.abs(ot - t)));
-            // Never prefer moving something INTO round 1 over an equally-safe later round — round
-            // 1 only wins this comparison when it's the only safe option at all.
-            const score = gap - (altRound === 1 ? 1e9 : 0);
+            // Never prefer moving something INTO round 1 OR the last round over an equally-safe
+            // middle round (see edgePenaltyFraction) — an edge round only wins this comparison when it's
+            // the only safe option at all.
+            const score = gap - edgePenaltyFraction(altRound, b.size) * 1e9;
             if (score > bestScore) { bestScore = score; bestAlt = altRound; }
           }
           if (bestAlt !== null) {
@@ -1914,9 +1964,13 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     const gameB = result.banks[b2.bi].pos[b2.p];
     // A swap (manual dropdown, per-bank refresh, "Try another arrangement") is never itself a
     // Mark-down replacement, even when one side happens to be a game a retirement placed earlier
-    // — clear the tag so it doesn't carry a stale "Replaces X" note to its new slot.
+    // — clear the tag so it doesn't carry a stale "Replaces X" note to its new slot. Same for
+    // sharedPick: a two-way swap moves games around, it doesn't create the deliberate one-way
+    // "pull a copy in" arrangement that note is for, so it shouldn't survive one either.
     delete gameA.retiredFrom;
     delete gameB.retiredFrom;
+    delete gameA.sharedPick;
+    delete gameB.sharedPick;
     result.banks[a.bi].pos[a.p] = gameB;
     result.banks[b2.bi].pos[b2.p] = gameA;
     if (a.bi !== b2.bi) {
@@ -2095,7 +2149,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       // retiredFrom cleared: this slot is being filled by "Try another arrangement," not by a
       // Mark-down replacement, even if `incoming` was sitting in the held-out pool because an
       // earlier retirement bumped it there (see retireGame/recomputeRepeats).
-      result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
+      result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null, retiredFrom: undefined, sharedPick: undefined };
       result.banks[target.bi].total += incoming.avgSec - outgoing.avgSec;
       result.droppedGames = result.droppedGames.filter(g => g.name !== incoming.name);
       result.droppedGames.push(outgoing);
@@ -2244,7 +2298,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
           for (let i = 0; i < ranked.length; i++) { r -= weights[i]; if (r <= 0) { pick = ranked[i].g; break; } }
           const outgoing = bank.pos[p];
           // retiredFrom cleared — see the matching note in perturbIncludedSet above.
-          bank.pos[p] = { ...pick, dupInstance: null, retiredFrom: undefined };
+          bank.pos[p] = { ...pick, dupInstance: null, retiredFrom: undefined, sharedPick: undefined };
           bank.total += pick.avgSec - outgoing.avgSec;
           availableDropped.splice(availableDropped.indexOf(pick), 1);
           result.droppedGames = result.droppedGames.filter(g => g !== pick);
@@ -2398,7 +2452,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       // retirement-duplicate itself (bumped out by a later manual edit or refresh — those clear
       // the tag on the way out, see swapSlots/refreshBankSlots/perturbIncludedSet), this overwrite
       // still leaves exactly one, current, correct reason on the slot.
-      bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: name };
+      bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: name, sharedPick: undefined };
     }
     recomputeRepeats(result);
     recomputeDerived(result);
@@ -2490,21 +2544,34 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         // always does, which is a worse arrangement even when the numbers look good. Sorted best
         // fit to worst within each of those tiers (era spread + time balance + repeat-count all
         // factor in — see optionFitScore/insertFitScore).
+        // Picking another bank's game here used to be a two-way SWAP — this slot got that game,
+        // and the other bank got whatever had been here, so "also changes Bank N" was true and
+        // had to be flagged. That's no longer how it works: picking a cross-bank option now pulls
+        // a COPY of that game in here and only here — the source bank's slot is left completely
+        // untouched — so the picked game becomes genuinely shared between the two banks (exactly
+        // the same "one machine, two banks, different rounds" arrangement the tool already uses
+        // elsewhere), and this slot's own outgoing game returns to the held-out pool (same as
+        // picking a "drop:" option) rather than landing in the other bank. "valid" now only means
+        // "safe to insert here" — no in-bank duplicate (hard rule) and no new same-round collision
+        // (soft — still offered, just flagged, same philosophy as every other option in this
+        // list) — see noDuplicateInBank/hasRoundCollision.
         const slotOptions = flatSlots
           .filter(s => s.bi !== bi || s.p === p) // drop same-bank/other-round — see above
           .map(s => {
-            const valid = (s.bi === bi && s.p === p) || isValidSwapTarget(result, { bi, p }, { bi: s.bi, p: s.p });
-            const disruptive = s.bi !== bi;
-            return { kind: 'slot', bi: s.bi, p: s.p, game: s.game, valid, disruptive, selected: s.bi === bi && s.p === p, score: optionFitScore(result, bi, p, { bi: s.bi, p: s.p, valid }) };
+            const isSelf = s.bi === bi && s.p === p;
+            const willShare = !isSelf; // every other survivor here is cross-bank by construction
+            const valid = isSelf || (noDuplicateInBank(b, p, s.game.name) && !hasRoundCollision(result, bi, p, s.game.name));
+            const score = isSelf ? 0 : insertFitScore(result, bi, p, s.game) + (valid ? 0 : CONFLICT_PENALTY);
+            return { kind: isSelf ? 'slot' : 'share', bi: s.bi, p: s.p, game: s.game, valid, willShare, selected: isSelf, score };
           });
         const dropOptions = (result.droppedGames || []).map((g, idx) => {
           let valid = true;
           for (let pp = 1; pp <= b.size; pp++) { if (pp !== p && b.pos[pp].name === g.name) { valid = false; break; } }
-          return { kind: 'drop', idx, game: g, valid, disruptive: false, selected: false, score: insertFitScore(result, bi, p, g) + (valid ? 0 : CONFLICT_PENALTY) };
+          return { kind: 'drop', idx, game: g, valid, willShare: false, selected: false, score: insertFitScore(result, bi, p, g) + (valid ? 0 : CONFLICT_PENALTY) };
         });
         const options = state.editMode ? [...slotOptions, ...dropOptions].sort((x, y) => x.score - y.score) : [];
-        const optionNote = o => (o.disruptive ? ` — also changes Bank ${o.bi + 1}` : '') + (o.valid ? '' : ' — conflicts');
-        const optionStyle = o => !o.valid ? ' style="color:#b45309;"' : (o.disruptive ? ' style="color:#8a8f98;"' : '');
+        const optionNote = o => (o.willShare ? ' — will be shared' : '') + (o.valid ? '' : ' — conflicts');
+        const optionStyle = o => !o.valid ? ' style="color:#b45309;"' : (o.willShare ? ' style="color:#7c3aed;"' : '');
         // "Select random <era>" quick picks — one click straight to the single best-fit held-out
         // game of that era for this slot (see bestDroppedCandidateForEra), instead of scanning the
         // full ranked list for a specific era. Only offered for an era with at least one game
@@ -2518,7 +2585,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
               ${eraQuickPicks.length ? `<optgroup label="Quick pick — best fit held out">
                 ${eraQuickPicks.map(x => `<option value="era:${x.era}">Select random ${x.era}</option>`).join('')}
               </optgroup>` : ''}
-              ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${optionStyle(o)}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${optionNote(o)}</option>`).join('')}
+              ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : o.kind === 'share' ? `share:${o.bi}-${o.p}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${optionStyle(o)}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${optionNote(o)}</option>`).join('')}
             </select>` : '';
         // "Mark down" — report this exact machine broken and auto-replace every slot showing it
         // (see retireGame), never touching any bank that didn't have it. Three states per slot:
@@ -2545,6 +2612,22 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         const retiredNote = g.retiredFrom
           ? `<div class="retiredNote">⚠ Replaces "${g.retiredFrom}" — marked down <button class="linklike undoRetireBtn no-print" data-bi="${bi}" data-p="${p}" type="button" title="Undo this Mark down">↺ Undo</button></div>`
           : '';
+        // A slot filled via the swap dropdown's "will be shared" pick (see slotOptions/share:
+        // handler above) gets its own explicit call-out — the small "shared" chip on the Round
+        // label is easy to miss right after a deliberate pick like this one. Recomputed fresh
+        // every render from repeatOccurrences rather than stored, so the bank list it names can
+        // never go stale even after "Try another arrangement" re-sorts bank order — and it only
+        // shows while the game is ACTUALLY still shared: if a later edit removes every other
+        // occurrence, this note quietly stops applying rather than lying about a share that no
+        // longer exists (sharedPick itself keeps riding along until a swap/refresh/perturb clears
+        // it, same lifecycle as retiredFrom, but the note's own truth comes from isRepeat).
+        const sharedNote = (g.sharedPick && isRepeat)
+          ? (() => {
+              const others = (result.repeatOccurrences[g.name] || []).filter(o => !(o.bank === bi && o.round === p));
+              const bankList = others.map(o => `Bank ${o.bank + 1}`).join(', ');
+              return `<div class="sharedNote">🔗 Shared${bankList ? ` — also in ${bankList}` : ''}</div>`;
+            })()
+          : '';
         slots.push(`
           <div class="slot">
             <div class="pos">
@@ -2553,6 +2636,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             </div>
             <div class="game">${g.name}</div>
             ${retiredNote}
+            ${sharedNote}
             <div class="footer">
               <span class="chip ${g.era.toLowerCase()}">${g.era}</span>
               <span class="time">${fmtSec(g.avgSec)}</span>
@@ -2582,7 +2666,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             const bank = state.result.banks[bi];
             const outgoing = bank.pos[p];
             // retiredFrom cleared — a manual pick from the dropdown, not a Mark-down replacement.
-            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
+            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined, sharedPick: undefined };
             bank.total += incoming.avgSec - outgoing.avgSec;
             state.result.droppedGames = state.result.droppedGames.filter((g, i) => i !== idx);
             state.result.droppedGames.push(outgoing);
@@ -2595,15 +2679,34 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             if (!incoming) return;
             const bank = state.result.banks[bi];
             const outgoing = bank.pos[p];
-            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
+            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined, sharedPick: undefined };
             bank.total += incoming.avgSec - outgoing.avgSec;
             state.result.droppedGames = state.result.droppedGames.filter(g => g !== incoming);
             state.result.droppedGames.push(outgoing);
             recomputeRepeats(state.result);
+          } else if (val.startsWith('share:')) {
+            // Pull a COPY of another bank's currently-playing game into this slot — a one-way
+            // insert, not a swap: the source bank's slot is left completely untouched (per the
+            // note above slotOptions), and this slot's outgoing game goes back to the held-out
+            // pool exactly like a "drop:" pick's does. The picked game is now legitimately shared
+            // between the two banks — recomputeRepeats will pick that up on its own (same "2+
+            // occurrences = shared" rule every other repeat in the tool already uses) and show the
+            // usual shared badge on both slots; sharedPick additionally tags THIS slot so it can
+            // carry its own explicit "Shared" note (see renderResults) rather than relying on the
+            // director to notice a small badge after a deliberate pick like this one.
+            const [sbi, sp] = val.slice(6).split('-').map(Number);
+            const sourceGame = state.result.banks[sbi]?.pos[sp];
+            if (!sourceGame) return;
+            const bank = state.result.banks[bi];
+            const outgoing = bank.pos[p];
+            bank.pos[p] = { ...sourceGame, dupInstance: null, retiredFrom: undefined, sharedPick: true };
+            bank.total += sourceGame.avgSec - outgoing.avgSec;
+            state.result.droppedGames = state.result.droppedGames || [];
+            state.result.droppedGames.push(outgoing);
+            recomputeRepeats(state.result);
           } else {
             const [tbi, tp] = val.slice(5).split('-').map(Number);
-            if (tbi === bi && tp === p) return;
-            swapSlots(state.result, { bi, p }, { bi: tbi, p: tp });
+            if (tbi === bi && tp === p) return; // the only "slot:" value left is the self/no-change entry
           }
           recomputeDerived(state.result);
           state.edited = true;
