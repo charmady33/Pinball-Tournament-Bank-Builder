@@ -2,7 +2,10 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Kanit:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
 /* ============================================================
-   DESIGN PLAN
+   DESIGN PLAN — v3: v1.0's exact visual design (this file is a
+   straight fork of template.html, not a redesign), plus styling
+   for the "Mark down" button ui.js already renders into every
+   slot (.pos, .retireBtn below) — v1.0 itself is left untouched.
    Color — service-panel palette: warm steel neutrals with an
      amber "marquee bulb" accent and a muted cabinet-trim teal
      for secondary state. Semantic good/warn kept separate from
@@ -225,10 +228,23 @@ tr:last-child td{border-bottom:none;}
 .bankRefreshBtn{padding:2px 8px; font-size:13px; line-height:1.4; border-radius:8px;}
 .bankGrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px;}
 .slot{background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px;}
-.slot .pos{font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-soft); margin-bottom:4px;}
+.slot .pos{display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-soft); margin-bottom:4px;}
 .slot .game{font-size:13.5px; font-weight:600; margin-bottom:6px; line-height:1.3;}
 .slot .footer{display:flex; justify-content:space-between; align-items:center;}
 .slot .time{font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:var(--ink-soft);}
+/* "Mark down" — reports a machine broken mid-tournament and auto-replaces every slot showing it
+   (retireGame() in ui.js), never touching any bank that didn't have that machine in it. Warn-
+   colored so it reads as a "trouble" action distinct from the neutral ghost buttons elsewhere.
+   "Restore" (a slot retireGame couldn't safely fix on its own, or the inline Undo on a replaced
+   slot's .retiredNote — see restoreGame()) reuses the same button shape in the calmer --accent2
+   color, since backing out isn't itself a warning. */
+.retireBtn{padding:3px 10px; font-size:11px; text-transform:none; letter-spacing:0; border-color:var(--warn); color:var(--warn); background:transparent;}
+.retireBtn:hover{background:var(--warn-bg);}
+.retireBtn.undoRetireBtn{border-color:var(--accent2); color:var(--accent2);}
+.retireBtn.undoRetireBtn:hover{background:color-mix(in srgb, var(--accent2) 15%, transparent);}
+.retiredNote{font-size:11px; font-weight:600; color:var(--warn); margin:-2px 0 6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
+.linklike{background:none; border:none; padding:0; margin:0; color:var(--accent2); font-weight:600; font-size:11px; text-decoration:underline; cursor:pointer;}
+.linklike:hover{opacity:.8;}
 
 footer.notes{margin-top:30px; padding-top:18px; border-top:1px solid var(--border); color:var(--ink-soft); font-size:12.5px;}
 footer.notes ul{margin:8px 0 16px 18px; padding:0;}
@@ -1320,6 +1336,10 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     editMode: false,
     numBanks: null,
     bankSize: null,
+    retiredGames: {},       // name -> true ("Mark down" — a machine reported broken mid-tournament;
+                             // kept out of future regenerates too via includeChoice, see retireGame()
+    retireLog: [],           // human-readable notes about each "Mark down" action, shown in the
+                             // Assumptions list alongside merges/exclusions/etc.
   };
 
   const overrides = safeGet(LS_OVERRIDES) || {}; // normKey -> era string or year number
@@ -1886,6 +1906,11 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   function swapSlots(result, a, b2) {
     const gameA = result.banks[a.bi].pos[a.p];
     const gameB = result.banks[b2.bi].pos[b2.p];
+    // A swap (manual dropdown, per-bank refresh, "Try another arrangement") is never itself a
+    // Mark-down replacement, even when one side happens to be a game a retirement placed earlier
+    // — clear the tag so it doesn't carry a stale "Replaces X" note to its new slot.
+    delete gameA.retiredFrom;
+    delete gameB.retiredFrom;
     result.banks[a.bi].pos[a.p] = gameB;
     result.banks[b2.bi].pos[b2.p] = gameA;
     if (a.bi !== b2.bi) {
@@ -2061,7 +2086,10 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       if (!pool.length) continue;
       const target = pool[Math.floor(Math.random() * pool.length)];
       const outgoing = result.banks[target.bi].pos[target.p];
-      result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null };
+      // retiredFrom cleared: this slot is being filled by "Try another arrangement," not by a
+      // Mark-down replacement, even if `incoming` was sitting in the held-out pool because an
+      // earlier retirement bumped it there (see retireGame/recomputeRepeats).
+      result.banks[target.bi].pos[target.p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
       result.banks[target.bi].total += incoming.avgSec - outgoing.avgSec;
       result.droppedGames = result.droppedGames.filter(g => g.name !== incoming.name);
       result.droppedGames.push(outgoing);
@@ -2159,9 +2187,21 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // arrangement. Pulling a held-out game into a slot (see refreshBankSlots below) can drop a
   // repeated game back down to a single occurrence, so the repeats list needs to stay in sync
   // with what's actually on the board — recomputed from scratch is cheap and always correct.
+  //
+  // A slot filled in by retireGame() (see below) is skipped when counting — a "Mark down"
+  // duplicate must never be able to turn some OTHER, untouched bank's slot into a newly "shared"
+  // one. That bank already finished generating; retiring a machine somewhere else is not allowed
+  // to change anything about it, full stop — the only banks a retirement may ever visibly affect
+  // are the ones that actually had the broken machine in them. The retirement slot itself still
+  // shows its own explicit "Replaces X — marked down" note instead (see renderResults), which is
+  // more useful than a bare "shared" tag anyway.
   function recomputeRepeats(result) {
     const counts = {};
-    result.banks.forEach(b => { for (let p = 1; p <= b.size; p++) { const n = b.pos[p].name; counts[n] = (counts[n] || 0) + 1; } });
+    result.banks.forEach(b => { for (let p = 1; p <= b.size; p++) {
+      const slot = b.pos[p];
+      if (slot.retiredFrom) continue;
+      counts[slot.name] = (counts[slot.name] || 0) + 1;
+    } });
     result.repeats = Object.keys(counts).filter(n => counts[n] > 1);
   }
 
@@ -2190,7 +2230,8 @@ Dracula\t23:47\t23:47\t23:47\t1`;
           let r = Math.random() * totalWeight, pick = ranked[ranked.length - 1].g;
           for (let i = 0; i < ranked.length; i++) { r -= weights[i]; if (r <= 0) { pick = ranked[i].g; break; } }
           const outgoing = bank.pos[p];
-          bank.pos[p] = { ...pick, dupInstance: null };
+          // retiredFrom cleared — see the matching note in perturbIncludedSet above.
+          bank.pos[p] = { ...pick, dupInstance: null, retiredFrom: undefined };
           bank.total += pick.avgSec - outgoing.avgSec;
           availableDropped.splice(availableDropped.indexOf(pick), 1);
           result.droppedGames = result.droppedGames.filter(g => g !== pick);
@@ -2222,6 +2263,145 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   function refreshBank(bankIndex) {
     refreshBankSlots(bankIndex);
     markEditedAndRender();
+  }
+
+  // ---------- "Mark down" — a machine breaks mid-tournament ----------
+  // Would inserting `gameName` at (bi, p) be safe? Same two checks as isValidSwapTarget, just for
+  // a one-directional insert (nothing is coming back out of this slot to place anywhere else) —
+  // no duplicate within the target bank, and no new same-round collision with another bank that's
+  // already scheduled to play that game this round.
+  function canInsertGameAt(result, bi, p, gameName) {
+    const bank = result.banks[bi];
+    for (let pp = 1; pp <= bank.size; pp++) {
+      if (pp !== p && bank.pos[pp].name === gameName) return false;
+    }
+    for (let bi2 = 0; bi2 < result.banks.length; bi2++) {
+      if (bi2 === bi) continue;
+      const b2 = result.banks[bi2];
+      if (p <= b2.size && b2.pos[p].name === gameName) return false;
+    }
+    return true;
+  }
+  // Best currently-held-out game for slot (bi, p) — the least disruptive fix, since it doesn't
+  // touch any other bank. Deterministic best-fit (not the weighted-random pick refreshBankSlots
+  // uses for variety) — a broken machine wants the single best replacement, not a different one
+  // each time.
+  function bestDroppedCandidateFor(result, bi, p) {
+    const bank = result.banks[bi];
+    const avail = result.droppedGames || [];
+    const safe = avail.filter(g => {
+      for (let pp = 1; pp <= bank.size; pp++) { if (pp !== p && bank.pos[pp].name === g.name) return false; }
+      return true;
+    });
+    if (!safe.length) return null;
+    const ranked = safe.map(g => ({ g, score: insertFitScore(result, bi, p, g) })).sort((a, b) => a.score - b.score);
+    return ranked[0].g;
+  }
+  // No held-out game available (or none safe)? Fall back to letting some other already-scheduled
+  // game repeat into this slot too — exactly the same "share a machine across banks" mechanism
+  // buildBanks() already uses when there aren't enough games to go around, just applied to one
+  // slot on demand. Never offers a retired (broken) game back, and mildly disfavors a game that's
+  // already shared so repeats don't pile onto the same few titles.
+  function bestRepeatCandidateFor(result, bi, p, retiredSet) {
+    const seen = new Set();
+    const candidates = [];
+    for (const s of allSlotsFlat(result)) {
+      const name = s.game.name;
+      if (seen.has(name) || retiredSet[name]) continue;
+      seen.add(name);
+      if (!canInsertGameAt(result, bi, p, name)) continue;
+      let score = insertFitScore(result, bi, p, s.game);
+      if (result.repeats.includes(name)) score += REPEAT_CANDIDATE_PENALTY;
+      candidates.push({ game: s.game, score });
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0].game;
+  }
+  // A machine just broke: replace every slot currently showing it, across every bank, with the
+  // next best fit — held-out games first (touches nothing else), then an existing game repeating
+  // into that slot too, same as the tool already does when there aren't enough games to go
+  // around. The broken game itself is discarded, not held out (it's not "available later this
+  // run," it's down), and is excluded from every future auto-fill (refresh, shuffle, a fresh
+  // Generate) for the rest of the session — Step 2's Active checkbox for it flips off too, so
+  // it's already unchecked if this run gets regenerated from scratch.
+  function retireGame(name) {
+    if (!state.result) return;
+    state.retiredGames[name] = true;
+    state.includeChoice[name] = false;
+    const result = state.result;
+    const initialCount = allSlotsFlat(result).filter(s => s.game.name === name).length;
+    const skipped = new Set();
+    let unresolvedCount = 0;
+    let guard = 0;
+    while (guard++ < 500) {
+      const occ = allSlotsFlat(result).find(s => s.game.name === name && !skipped.has(`${s.bi}-${s.p}`));
+      if (!occ) break;
+      const { bi, p } = occ;
+      let incoming = bestDroppedCandidateFor(result, bi, p);
+      if (incoming) {
+        result.droppedGames = (result.droppedGames || []).filter(g => g !== incoming);
+      } else {
+        incoming = bestRepeatCandidateFor(result, bi, p, state.retiredGames);
+      }
+      if (!incoming) {
+        skipped.add(`${bi}-${p}`);
+        unresolvedCount++;
+        continue;
+      }
+      const bank = result.banks[bi];
+      bank.total += incoming.avgSec - bank.pos[p].avgSec;
+      // retiredFrom marks this slot as a Mark-down replacement: recomputeRepeats() skips it when
+      // counting occurrences, so duplicating a game that's already placed in another bank never
+      // makes THAT bank's slot look "shared" — this slot carries its own explicit note instead
+      // (see the .retiredNote render in renderResults). If `incoming` happened to be a stale
+      // retirement-duplicate itself (bumped out by a later manual edit or refresh — those clear
+      // the tag on the way out, see swapSlots/refreshBankSlots/perturbIncludedSet), this overwrite
+      // still leaves exactly one, current, correct reason on the slot.
+      bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: name };
+    }
+    recomputeRepeats(result);
+    recomputeDerived(result);
+    state.retireLog.push(unresolvedCount
+      ? `Marked "${name}" down — replaced it in ${initialCount - unresolvedCount} of ${initialCount} slot(s) automatically; ${unresolvedCount} slot(s) still show it and need a manual fix in Edit banks (no safe replacement was available without a duplicate or round clash).`
+      : `Marked "${name}" down — automatically replaced it in ${initialCount} slot(s) with the next best fit.`);
+    state.edited = true;
+    $('resetEditsBtn').hidden = false;
+    renderResults();
+  }
+
+  // Undo a "Mark down" — brings `name` back into every slot retireGame replaced it in (anything
+  // still tagged .retiredFrom === name; a slot the director has since manually re-edited or
+  // refreshed away from that replacement was already released from this tracking when it changed
+  // — see the retiredFrom-clearing notes in swapSlots/refreshBankSlots/perturbIncludedSet — so
+  // restoring never overwrites a deliberate later edit), clears its retired/excluded status so
+  // it's active again for any future regenerate, and leaves a note in the Assumptions list.
+  function restoreGame(name) {
+    if (!state.retiredGames[name] || !state.result) return;
+    delete state.retiredGames[name];
+    if (state.includeChoice[name] === false) delete state.includeChoice[name];
+    const result = state.result;
+    const original = state.allClassified.find(g => g.name === name);
+    let restoredCount = 0;
+    if (original) {
+      result.banks.forEach(b => {
+        for (let p = 1; p <= b.size; p++) {
+          if (b.pos[p].retiredFrom === name) {
+            b.total += original.avgSec - b.pos[p].avgSec;
+            b.pos[p] = { ...original, dupInstance: null };
+            restoredCount++;
+          }
+        }
+      });
+    }
+    recomputeRepeats(result);
+    recomputeDerived(result);
+    state.retireLog.push(restoredCount
+      ? `Restored "${name}" — brought it back into ${restoredCount} slot(s) that Mark down had replaced it in.`
+      : `Restored "${name}" — no longer marked down.`);
+    state.edited = true;
+    $('resetEditsBtn').hidden = false;
+    renderResults();
   }
 
   // ---------- RESULTS ----------
@@ -2289,10 +2469,35 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
               ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${optionStyle(o)}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${optionNote(o)}</option>`).join('')}
             </select>` : '';
+        // "Mark down" — report this exact machine broken and auto-replace every slot showing it
+        // (see retireGame), never touching any bank that didn't have it. Three states per slot:
+        //   1. Normal — offer "Mark down".
+        //   2. This slot IS the replacement retireGame made — show which game it replaced, with
+        //      an inline Undo that brings that game back into every slot it was replaced from
+        //      (see restoreGame).
+        //   3. retireGame couldn't find anywhere safe to put THIS occurrence (rare — no held-out
+        //      or duplicate candidate fit) — it's still showing the broken game; offer Restore
+        //      (undo the whole Mark down) instead of a dead-end disabled button, since retrying
+        //      the automatic fix isn't on offer here, but backing out always is.
+        const isStillDown = !!state.retiredGames[g.name] && !g.retiredFrom;
+        const retireControl = isStillDown
+          ? `<button class="ghost small no-print retireBtn undoRetireBtn" data-bi="${bi}" data-p="${p}" type="button" title="No safe automatic replacement was found for this slot — undo the Mark down, or fix it by hand in Edit banks.">↺ Restore</button>`
+          : `<button class="ghost small no-print retireBtn" data-bi="${bi}" data-p="${p}" type="button" title="Report this machine broken — automatically replace every bank/round currently scheduled to use it with the next best fit">⚠ Mark down</button>`;
+        // The game's own name already appears unescaped elsewhere in this template (e.g. the
+        // .game div right above), so it's fine in text content here too — it's deliberately kept
+        // out of the button's title attribute instead, since an embedded quote there could break
+        // the markup (data-bi/data-p is how the click handler finds the name, not this string).
+        const retiredNote = g.retiredFrom
+          ? `<div class="retiredNote">⚠ Replaces "${g.retiredFrom}" — marked down <button class="linklike undoRetireBtn no-print" data-bi="${bi}" data-p="${p}" type="button" title="Undo this Mark down">↺ Undo</button></div>`
+          : '';
         slots.push(`
           <div class="slot">
-            <div class="pos">Round ${p}${isRepeat ? ` <span class="chip repeat${isCollision ? ' collision' : ''}" style="margin-left:4px;"${isCollision ? ' title="Also scheduled in this same round in another bank — starts at the same time"' : ' title="This game is also scheduled in another bank"'}>shared</span>` : ''}</div>
+            <div class="pos">
+              <span class="posLabel">Round ${p}${isRepeat ? ` <span class="chip repeat${isCollision ? ' collision' : ''}" style="margin-left:4px;"${isCollision ? ' title="Also scheduled in this same round in another bank — starts at the same time"' : ' title="This game is also scheduled in another bank"'}>shared</span>` : ''}</span>
+              ${retireControl}
+            </div>
             <div class="game">${g.name}</div>
+            ${retiredNote}
             <div class="footer">
               <span class="chip ${g.era.toLowerCase()}">${g.era}</span>
               <span class="time">${fmtSec(g.avgSec)}</span>
@@ -2321,7 +2526,8 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             if (!incoming) return;
             const bank = state.result.banks[bi];
             const outgoing = bank.pos[p];
-            bank.pos[p] = { ...incoming, dupInstance: null };
+            // retiredFrom cleared — a manual pick from the dropdown, not a Mark-down replacement.
+            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
             bank.total += incoming.avgSec - outgoing.avgSec;
             state.result.droppedGames = state.result.droppedGames.filter((g, i) => i !== idx);
             state.result.droppedGames.push(outgoing);
@@ -2341,6 +2547,26 @@ Dracula\t23:47\t23:47\t23:47\t1`;
 
     list.querySelectorAll('.bankRefreshBtn').forEach(btn => {
       btn.addEventListener('click', () => refreshBank(parseInt(btn.dataset.bi, 10)));
+    });
+
+    list.querySelectorAll('.retireBtn:not(.undoRetireBtn)').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const bi = parseInt(btn.dataset.bi, 10), p = parseInt(btn.dataset.p, 10);
+        const name = state.result.banks[bi].pos[p].name;
+        retireGame(name);
+      });
+    });
+
+    // Undo shows up two ways: on a "Still down" slot (nothing to restore in THIS slot's data —
+    // it already shows the broken game, restoreGame just clears its retired status) and inline on
+    // a .retiredNote (this slot's game is a Mark-down replacement — restoreGame reads which game
+    // it replaced from .retiredFrom and brings that game back into every slot it was pulled from).
+    list.querySelectorAll('.undoRetireBtn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const bi = parseInt(btn.dataset.bi, 10), p = parseInt(btn.dataset.p, 10);
+        const slot = state.result.banks[bi].pos[p];
+        restoreGame(slot.retiredFrom || slot.name);
+      });
     });
 
     const repeatSection = $('repeatSection');
@@ -2414,6 +2640,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     if (state.result.repeats.length) notes.push(`${state.result.repeats.length} game(s) share a machine across two banks (shortest-average games, chosen automatically for faster turnover): ${state.result.repeats.join(', ')}.`);
     if (state.result.droppedGames && state.result.droppedGames.length) notes.push(`${state.result.droppedGames.length} game(s) didn't fit this run's slots and were automatically held out — see "Held out this run" below.`);
     if (state.edited) notes.push(`Banks were manually adjusted after generation — use "Reset to auto-generated" to undo all manual swaps.`);
+    state.retireLog.forEach(n => notes.push(n));
     const listEl = $('notesList');
     listEl.innerHTML = notes.length ? notes.map(n => `<li>${n}</li>`).join('') : '<li>No merges, exclusions, or era corrections were needed.</li>';
   }
@@ -2764,6 +2991,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     state.rows = []; state.manualGames = []; state.dupGroups = []; state.mergeChoice = {}; state.workingGames = [];
     state.includeChoice = {}; state.timeOverride = {}; state.forceInclude = {}; state.included = []; state.classified = []; state.allClassified = []; state.result = null;
     state.originalSnapshot = null; state.idealSnapshot = null; state.edited = false; state.editMode = false;
+    state.retiredGames = {}; state.retireLog = [];
     $('dataInput').value = '';
     safeSet(LS_DRAFT, '');
     $('card2').hidden = true; $('card3').hidden = true; $('resultsCard').hidden = true; $('notesFooter').hidden = true;
