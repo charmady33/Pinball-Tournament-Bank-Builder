@@ -1799,6 +1799,12 @@ Dracula\t23:47\t23:47\t23:47\t1`;
       const idealStats = { max: idealMaxTotal, range: idealRange };
       perturbIncludedSet(result, idealStats);
       perturbArrangement(result, idealStats);
+      // Perturbing swaps games (and totals) between banks without moving them in the array, so
+      // the longest-first order set above (line ~474) is stale by the time this finishes — re-sort
+      // now, before recomputeDerived below reads bank index into repeatOccurrences/etc., so "Bank
+      // 1" is still the longest bank after "Try another arrangement" too.
+      result.banks.sort((a, b) => b.total - a.total);
+      result.bankSizes = result.banks.map(b => b.size);
       recomputeDerived(result);
     }
 
@@ -2116,6 +2122,13 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   // that only touches this bank (held-out fills, or "no change") — comfortably below
   // CONFLICT_PENALTY so an outright conflict still sorts dead last of all.
   const REPEAT_CANDIDATE_PENALTY = 500; // mild nudge against picking an already-shared game
+  const ROUND_COLLISION_PENALTY = 5000; // last-resort nudge for retireGame's repeat-fill fallback
+  // (see bestRepeatCandidateFor) — a same-round overlap with another bank is a scheduling
+  // inconvenience the director can move later (the app already tolerates and flags it — the
+  // "Some games are scheduled in the same round across banks" banner), so it outranks
+  // REPEAT_CANDIDATE_PENALTY but must never block a Mark-down replacement outright: a machine
+  // that's actually broken staying on the schedule because no *collision-free* stand-in existed
+  // is strictly worse than a stand-in that merely overlaps another bank's round.
   // Pool-wide average release year, used the same way buildBanks() uses it internally: a small
   // tiebreaker on top of era-pairwise cost (see bankSpreadPenalty/bankYearSum/yearImbalancePenalty
   // in logic.js) so a manual swap that's a wash on era bands alone still gets nudged toward
@@ -2266,21 +2279,25 @@ Dracula\t23:47\t23:47\t23:47\t1`;
   }
 
   // ---------- "Mark down" — a machine breaks mid-tournament ----------
-  // Would inserting `gameName` at (bi, p) be safe? Same two checks as isValidSwapTarget, just for
-  // a one-directional insert (nothing is coming back out of this slot to place anywhere else) —
-  // no duplicate within the target bank, and no new same-round collision with another bank that's
-  // already scheduled to play that game this round.
-  function canInsertGameAt(result, bi, p, gameName) {
-    const bank = result.banks[bi];
+  // Two very different kinds of "would this insert be a problem": a duplicate within the target
+  // bank is a hard impossibility (a bank can't play the same title twice) and is never allowed,
+  // full stop. A same-round collision with another bank is just a scheduling overlap — the exact
+  // thing the "Some games are scheduled in the same round across banks" banner already flags and
+  // tolerates elsewhere in the tool — so it's checked separately and only avoided when possible
+  // (see bestRepeatCandidateFor below), never used to block a Mark-down replacement outright.
+  function noDuplicateInBank(bank, p, gameName) {
     for (let pp = 1; pp <= bank.size; pp++) {
       if (pp !== p && bank.pos[pp].name === gameName) return false;
     }
+    return true;
+  }
+  function hasRoundCollision(result, bi, p, gameName) {
     for (let bi2 = 0; bi2 < result.banks.length; bi2++) {
       if (bi2 === bi) continue;
       const b2 = result.banks[bi2];
-      if (p <= b2.size && b2.pos[p].name === gameName) return false;
+      if (p <= b2.size && b2.pos[p].name === gameName) return true;
     }
-    return true;
+    return false;
   }
   // Best currently-held-out game for slot (bi, p) — the least disruptive fix, since it doesn't
   // touch any other bank. Deterministic best-fit (not the weighted-random pick refreshBankSlots
@@ -2297,21 +2314,44 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     const ranked = safe.map(g => ({ g, score: insertFitScore(result, bi, p, g) })).sort((a, b) => a.score - b.score);
     return ranked[0].g;
   }
+  // The manual swap dropdown's "Best-fit <era>" quick picks (Edit banks) — one held-out game away
+  // from listing every dropped game individually, this jumps straight to the single best-fit
+  // held-out game of a chosen era for this exact slot (same insertFitScore ranking the individual
+  // dropped-game options already use). Prefers a candidate that's actually safe to insert here
+  // (no in-bank duplicate), but — like every other option in this dropdown — never refuses to
+  // offer the only candidate of that era just because it conflicts; it's picked anyway, flagged
+  // the same way a manually-chosen conflicting option would be. Returns null only when nothing
+  // held out is of that era at all.
+  function bestDroppedCandidateForEra(result, bi, p, era) {
+    const bank = result.banks[bi];
+    const avail = (result.droppedGames || []).filter(g => g.era === era);
+    if (!avail.length) return null;
+    const ranked = avail
+      .map(g => ({ g, score: insertFitScore(result, bi, p, g) + (noDuplicateInBank(bank, p, g.name) ? 0 : CONFLICT_PENALTY) }))
+      .sort((a, b) => a.score - b.score);
+    return ranked[0].g;
+  }
   // No held-out game available (or none safe)? Fall back to letting some other already-scheduled
   // game repeat into this slot too — exactly the same "share a machine across banks" mechanism
   // buildBanks() already uses when there aren't enough games to go around, just applied to one
-  // slot on demand. Never offers a retired (broken) game back, and mildly disfavors a game that's
-  // already shared so repeats don't pile onto the same few titles.
+  // slot on demand. Never offers a retired (broken) game back, mildly disfavors a game that's
+  // already shared so repeats don't pile onto the same few titles, and — since every occurrence of
+  // the broken game has to be resolved, not just the ones with a clean stand-in available — will
+  // still pick a same-round overlap with another bank over leaving the slot showing a game that
+  // can't actually be played (see ROUND_COLLISION_PENALTY above): it's ranked last, but it's never
+  // excluded outright the way an in-bank duplicate is.
   function bestRepeatCandidateFor(result, bi, p, retiredSet) {
+    const bank = result.banks[bi];
     const seen = new Set();
     const candidates = [];
     for (const s of allSlotsFlat(result)) {
       const name = s.game.name;
       if (seen.has(name) || retiredSet[name]) continue;
       seen.add(name);
-      if (!canInsertGameAt(result, bi, p, name)) continue;
+      if (!noDuplicateInBank(bank, p, name)) continue; // hard constraint — always excluded
       let score = insertFitScore(result, bi, p, s.game);
       if (result.repeats.includes(name)) score += REPEAT_CANDIDATE_PENALTY;
+      if (hasRoundCollision(result, bi, p, name)) score += ROUND_COLLISION_PENALTY; // last resort, not a block
       candidates.push({ game: s.game, score });
     }
     if (!candidates.length) return null;
@@ -2363,7 +2403,7 @@ Dracula\t23:47\t23:47\t23:47\t1`;
     recomputeRepeats(result);
     recomputeDerived(result);
     state.retireLog.push(unresolvedCount
-      ? `Marked "${name}" down — replaced it in ${initialCount - unresolvedCount} of ${initialCount} slot(s) automatically; ${unresolvedCount} slot(s) still show it and need a manual fix in Edit banks (no safe replacement was available without a duplicate or round clash).`
+      ? `Marked "${name}" down — replaced it in ${initialCount - unresolvedCount} of ${initialCount} slot(s) automatically; ${unresolvedCount} slot(s) still show it and need a manual fix in Edit banks (every other active game already plays somewhere in that bank, so none could be inserted without a duplicate).`
       : `Marked "${name}" down — automatically replaced it in ${initialCount} slot(s) with the next best fit.`);
     state.edited = true;
     $('resetEditsBtn').hidden = false;
@@ -2465,8 +2505,19 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         const options = state.editMode ? [...slotOptions, ...dropOptions].sort((x, y) => x.score - y.score) : [];
         const optionNote = o => (o.disruptive ? ` — also changes Bank ${o.bi + 1}` : '') + (o.valid ? '' : ' — conflicts');
         const optionStyle = o => !o.valid ? ' style="color:#b45309;"' : (o.disruptive ? ' style="color:#8a8f98;"' : '');
+        // "Select random <era>" quick picks — one click straight to the single best-fit held-out
+        // game of that era for this slot (see bestDroppedCandidateForEra), instead of scanning the
+        // full ranked list for a specific era. Only offered for an era with at least one game
+        // currently held out; "random" is the label the director asked for, but the pick itself is
+        // deterministic best-fit, same as every other held-out option here.
+        const eraQuickPicks = ERA_ORDER
+          .map(era => ({ era, game: bestDroppedCandidateForEra(result, bi, p, era) }))
+          .filter(x => x.game);
         const swapControl = state.editMode ? `
             <select class="swapSelect" data-bi="${bi}" data-p="${p}" style="margin-top:8px; width:100%; font-size:11.5px; padding:5px 6px;">
+              ${eraQuickPicks.length ? `<optgroup label="Quick pick — best fit held out">
+                ${eraQuickPicks.map(x => `<option value="era:${x.era}">Select random ${x.era}</option>`).join('')}
+              </optgroup>` : ''}
               ${options.map(o => `<option value="${o.kind === 'drop' ? `drop:${o.idx}` : `slot:${o.bi}-${o.p}`}" ${o.selected ? 'selected' : ''}${optionStyle(o)}>${o.game.name} — ${o.game.era} — ${fmtSec(o.game.avgSec)}${optionNote(o)}</option>`).join('')}
             </select>` : '';
         // "Mark down" — report this exact machine broken and auto-replace every slot showing it
@@ -2475,13 +2526,17 @@ Dracula\t23:47\t23:47\t23:47\t1`;
         //   2. This slot IS the replacement retireGame made — show which game it replaced, with
         //      an inline Undo that brings that game back into every slot it was replaced from
         //      (see restoreGame).
-        //   3. retireGame couldn't find anywhere safe to put THIS occurrence (rare — no held-out
-        //      or duplicate candidate fit) — it's still showing the broken game; offer Restore
-        //      (undo the whole Mark down) instead of a dead-end disabled button, since retrying
-        //      the automatic fix isn't on offer here, but backing out always is.
+        //   3. retireGame couldn't find anywhere safe to put THIS occurrence — every other active
+        //      game already plays somewhere in this exact bank, so nothing could be inserted
+        //      without a duplicate (a same-round overlap with another bank is not this case —
+        //      retireGame accepts that as a last resort rather than leaving the slot unresolved,
+        //      see ROUND_COLLISION_PENALTY). Very rare in practice; the slot still shows the
+        //      broken game, so offer Restore (undo the whole Mark down) instead of a dead-end
+        //      disabled button, since retrying the automatic fix isn't on offer here, but backing
+        //      out always is.
         const isStillDown = !!state.retiredGames[g.name] && !g.retiredFrom;
         const retireControl = isStillDown
-          ? `<button class="ghost small no-print retireBtn undoRetireBtn" data-bi="${bi}" data-p="${p}" type="button" title="No safe automatic replacement was found for this slot — undo the Mark down, or fix it by hand in Edit banks.">↺ Restore</button>`
+          ? `<button class="ghost small no-print retireBtn undoRetireBtn" data-bi="${bi}" data-p="${p}" type="button" title="Every other active game already plays somewhere in this bank, so none could be inserted here without a duplicate — undo the Mark down, or fix it by hand in Edit banks.">↺ Restore</button>`
           : `<button class="ghost small no-print retireBtn" data-bi="${bi}" data-p="${p}" type="button" title="Report this machine broken — automatically replace every bank/round currently scheduled to use it with the next best fit">⚠ Mark down</button>`;
         // The game's own name already appears unescaped elsewhere in this template (e.g. the
         // .game div right above), so it's fine in text content here too — it's deliberately kept
@@ -2530,6 +2585,19 @@ Dracula\t23:47\t23:47\t23:47\t1`;
             bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
             bank.total += incoming.avgSec - outgoing.avgSec;
             state.result.droppedGames = state.result.droppedGames.filter((g, i) => i !== idx);
+            state.result.droppedGames.push(outgoing);
+            recomputeRepeats(state.result);
+          } else if (val.startsWith('era:')) {
+            // "Select random <era>" quick pick — re-resolve at click time (not from whatever was
+            // computed at render) so it reflects the current droppedGames pool exactly.
+            const era = val.slice(4);
+            const incoming = bestDroppedCandidateForEra(state.result, bi, p, era);
+            if (!incoming) return;
+            const bank = state.result.banks[bi];
+            const outgoing = bank.pos[p];
+            bank.pos[p] = { ...incoming, dupInstance: null, retiredFrom: undefined };
+            bank.total += incoming.avgSec - outgoing.avgSec;
+            state.result.droppedGames = state.result.droppedGames.filter(g => g !== incoming);
             state.result.droppedGames.push(outgoing);
             recomputeRepeats(state.result);
           } else {
